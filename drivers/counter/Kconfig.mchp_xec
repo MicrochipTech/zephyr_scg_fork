@@ -1,0 +1,9 @@
+# Copyright (c) 2026 Microchip Technology Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+config COUNTER_MCHP_XEC_RTIMER
+	bool "Microchip XEC series counter driver using 32KHz, 32-bit RTOS timer"
+	default y
+	depends on DT_HAS_MICROCHIP_XEC_RTIMER_COUNTER_ENABLED
+	help
+	  Enable counter driver for Microchip XEC using 32KHz, 32-bit RTOS timer.
