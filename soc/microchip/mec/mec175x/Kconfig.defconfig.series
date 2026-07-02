@@ -35,6 +35,6 @@ config SYS_CLOCK_TICKS_PER_SEC
 endif # MCHP_XEC_RTOS_TIMER
 
 config ARCH_HAS_CUSTOM_BUSY_WAIT
-	default y
+	default y if MCHP_XEC_RTOS_TIMER
 
 endif # SOC_SERIES_MEC175X
