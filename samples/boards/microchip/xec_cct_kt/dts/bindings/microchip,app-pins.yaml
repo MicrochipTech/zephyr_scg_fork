@@ -12,6 +12,6 @@ description: |
   (it expands to DT_FOREACH_PROP_ELEM(node, pinctrl_0, ...), whose helper macro
   is only generated for a binding-declared property).
 
-compatible: "microchip,xec-test-clk-out"
+compatible: "microchip,app-pins"
 
 include: [base.yaml, pinctrl-device.yaml]
