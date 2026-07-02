@@ -26,13 +26,13 @@
 	 * the pin mux only connects the pad; which clock is driven out is selected
 	 * separately in SoC clock-out/VBAT test logic and is not configured here.
 	 */
-	tst_clk_out: tst-clk-out {
+	app_pin_list: app-pin-list {
 		/* App-local binding (dts/bindings/microchip,xec-test-clk-out.yaml)
 		 * includes pinctrl-device.yaml so pinctrl-0/pinctrl-names are typed
 		 * properties -- required for PINCTRL_DT_DEFINE() in main.c to compile.
 		 */
-		compatible = "microchip,xec-test-clk-out";
-		pinctrl-0 = <&tst_clk_out_gpio060>;
+		compatible = "microchip,app-pins";
+		pinctrl-0 = <&tst_clk_out_gpio060 &vci_in1_n_gpio162>;
 		pinctrl-names = "default";
 	};
 };
