@@ -10,7 +10,7 @@ compatible: "microchip,xec-i2c-v3-nl-port"
 # i2c-controller.yaml lets the port node be treated as an I2C master bus.
 # pinctrl-device.yaml exposes the pinctrl-0/pinctrl-names properties used to
 # pick the SCL/SDA pads for this physical port.
-include: ["i2c-controller.yaml", "pinctrl-device.yaml"]
+include: ["i2c-controller.yaml", "pinctrl-device.yaml", "pm.yaml"]
 
 properties:
   controller:

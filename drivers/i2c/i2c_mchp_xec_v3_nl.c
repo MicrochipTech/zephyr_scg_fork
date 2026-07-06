@@ -112,6 +112,8 @@
 #include <zephyr/irq.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/pm/pm.h>
+#include <zephyr/pm/device.h>
 #include <zephyr/sys/util.h>
 
 LOG_MODULE_REGISTER(i2c_mchp_xec_v3_nl, CONFIG_I2C_LOG_LEVEL);
@@ -348,6 +350,8 @@ struct xec_i2c_nl_config {
 	uint32_t dflt_freq;
 	uint8_t girq;
 	uint8_t girq_pos;
+	uint8_t girq_wk;
+	uint8_t girq_wk_pos;
 	uint16_t enc_pcr;
 	uint8_t dma_chan;     /* host-mode channel  */
 	uint8_t dma_slot;     /* host-mode trigsrc  */
@@ -371,6 +375,7 @@ struct xec_i2c_nl_data {
 	enum xec_i2c_nl_state state;
 	int xfer_err;
 
+	uint8_t ctrl_state;
 	uint8_t active_port; /* XEC_I2C_NL_INVALID_PORT until programmed */
 	uint32_t active_freq;
 
@@ -403,6 +408,7 @@ struct xec_i2c_nl_port_config {
 	uint32_t bitrate;
 	uint8_t port_id;
 	bool is_default;
+	bool wakeup_source;
 };
 
 /* Parsed summary of an i2c_transfer() request after flag/shape validation.
@@ -2639,6 +2645,111 @@ static int xec_i2c_nl_ctrl_init(const struct device *ctrl)
 	return 0;
 }
 
+#ifdef CONFIG_PM_DEVICE
+/* I2C wake is only for target mode in response to externally generated START.
+ * If port has wakeup-source property, controller associated with the port is configured
+ * for that port and is in target mode then we arm this controller for wake from suspend.
+ */
+static int xec_i2c_nl_port_pm_suspend(const struct device *port_dev)
+{
+	const struct xec_i2c_nl_port_config *pc = port_dev->config;
+	const struct xec_i2c_nl_config *cfg = pc->parent->config;
+	struct xec_i2c_nl_data *data = pc->parent->data;
+	int rc = 0;
+
+#ifdef CONFIG_I2C_TARGET
+	if (pc->wakeup_source && (data->active_port == pc->port_id) && (data->tgt_count != 0)) {
+		sys_write32(BIT(XEC_I2C_WKSR_SB_POS), cfg->base + XEC_I2C_WKSR_OFS);
+		soc_ecia_girq_status_clear(cfg->girq_wk, cfg->girq_wk_pos);
+		soc_ecia_girq_ctrl(cfg->girq_wk, cfg->girq_wk_pos, 1U);
+		sys_set_bit(cfg->base + XEC_I2C_WKCR_OFS, XEC_I2C_WKCR_SBEN_POS);
+	} else
+#endif
+	{
+		sys_clear_bit(cfg->base + XEC_I2C_CFG_OFS, XEC_I2C_CFG_ENAB_POS);
+		rc = pinctrl_apply_state(pc->pcfg, PINCTRL_STATE_SLEEP);
+		if (rc == -ENOENT) {
+			rc = 0;
+		}
+	}
+
+	data->ctrl_state = (uint8_t)PM_DEVICE_STATE_SUSPENDED;
+
+	return rc;
+}
+
+static int xec_i2c_nl_port_pm_resume(const struct device *port_dev)
+{
+	const struct xec_i2c_nl_port_config *pc = port_dev->config;
+	struct xec_i2c_nl_data *data = pc->parent->data;
+
+	data->ctrl_state = (uint8_t)(uint8_t)PM_DEVICE_STATE_ACTIVE;
+
+	return 0;
+}
+
+static int xec_i2c_nl_port_pm_off(const struct device *port_dev)
+{
+	const struct xec_i2c_nl_port_config *pc = port_dev->config;
+	const struct xec_i2c_nl_config *cfg = pc->parent->config;
+	struct xec_i2c_nl_data *data = pc->parent->data;
+	int rc = 0;
+
+	sys_clear_bit(cfg->base + XEC_I2C_CFG_OFS, XEC_I2C_CFG_ENAB_POS);
+	rc = pinctrl_apply_state(pc->pcfg, PINCTRL_STATE_SLEEP);
+	if (rc == -ENOENT) {
+		rc = 0;
+	}
+
+	data->ctrl_state = (uint8_t)PM_DEVICE_STATE_OFF;
+
+	return 0;
+}
+
+static int xec_i2c_nl_port_pm_on(const struct device *port_dev)
+{
+	const struct xec_i2c_nl_port_config *pc = port_dev->config;
+	struct xec_i2c_nl_data *data = pc->parent->data;
+	int rc = 0;
+
+	/* TODO re-configure I2C */
+
+	rc = pinctrl_apply_state(pc->pcfg, PINCTRL_STATE_DEFAULT);
+
+	data->ctrl_state = (uint8_t)PM_DEVICE_STATE_ACTIVE;
+
+	return rc;
+}
+
+static int xec_i2c_nl_port_pm_cb(const struct device *port_dev, enum pm_device_action action)
+{
+	int rc = 0;
+
+	switch (action) {
+	case PM_DEVICE_ACTION_SUSPEND:
+		rc = xec_i2c_nl_port_pm_suspend(port_dev);
+		break;
+	case PM_DEVICE_ACTION_RESUME:
+		rc = xec_i2c_nl_port_pm_resume(port_dev);
+		break;
+	case PM_DEVICE_ACTION_TURN_OFF:
+		rc = xec_i2c_nl_port_pm_off(port_dev);
+		break;
+	case PM_DEVICE_ACTION_TURN_ON:
+		rc = xec_i2c_nl_port_pm_on(port_dev);
+		break;
+	default:
+		rc = -ENOTSUP;
+	}
+
+	return rc;
+}
+#endif /* CONFIG_PM_DEVICE */
+
+/* TODO - Should we set controller DT_DEVICE init pointer to NULL
+ * and use port DT_DEVICE init pointer to configure device
+ * We only do HW init for port with default-port property
+ */
 static int xec_i2c_nl_port_init(const struct device *port_dev)
 {
 	const struct xec_i2c_nl_port_config *pc = port_dev->config;
@@ -2664,8 +2775,14 @@ static int xec_i2c_nl_port_init(const struct device *port_dev)
 
 #define DT_DRV_COMPAT microchip_xec_i2c_v3_nl
 
-#define XEC_I2C_NL_GIRQ(inst)     MCHP_XEC_ECIA_GIRQ(DT_INST_PROP(inst, girqs))
-#define XEC_I2C_NL_GIRQ_POS(inst) MCHP_XEC_ECIA_GIRQ_POS(DT_INST_PROP(inst, girqs))
+#define XEC_I2C_NL_GIRQ(inst)     DT_INST_PROP_BY_IDX(inst, girqs, 0)
+#define XEC_I2C_NL_GIRQ_POS(inst) DT_INST_PROP_BY_IDX(inst, girqs, 1)
+
+#define XEC_I2C_NL_GIRQ_WK(inst) \
+	COND_CODE_1(DT_INST_PROP_HAS_IDX(inst, girq, 2), DT_INST_PROP_BY_IDX(inst, girqs, 2), (0))
+
+#define XEC_I2C_NL_GIRQ_WK_POS(inst) \
+	COND_CODE_1(DT_INST_PROP_HAS_IDX(inst, girq, 2), DT_INST_PROP_BY_IDX(inst, girqs, 3), (0))
 
 /* The controller binding does not carry clock-frequency — it lives on the
  * port nodes. The controller's default frequency is only the value the
@@ -2747,14 +2864,16 @@ static int xec_i2c_nl_port_init(const struct device *port_dev)
 		.dflt_freq = XEC_I2C_NL_DFLT_FREQ(inst),                                           \
 		.girq = XEC_I2C_NL_GIRQ(inst),                                                     \
 		.girq_pos = XEC_I2C_NL_GIRQ_POS(inst),                                             \
+		.girq_wk = XEC_I2C_NL_GIRQ_WK(inst),                                               \
+		.girq_wk_pos = XEC_I2C_NL_GIRQ_WK_POS(inst),                                       \
 		.enc_pcr = DT_INST_PROP(inst, pcr_scr),                                            \
 		.dma_chan = DT_INST_DMAS_CELL_BY_NAME(inst, host, channel),                        \
 		.dma_slot = DT_INST_DMAS_CELL_BY_NAME(inst, host, trigsrc),                        \
 		XEC_I2C_NL_TGT_FIELDS(inst)};                                                      \
 	static struct xec_i2c_nl_data xec_i2c_nl_data_##inst;                                      \
-	DEVICE_DT_INST_DEFINE(inst, xec_i2c_nl_ctrl_init, NULL, &xec_i2c_nl_data_##inst,           \
-			      &xec_i2c_nl_cfg_##inst, POST_KERNEL, CONFIG_I2C_INIT_PRIORITY,       \
-			      NULL);
+	DEVICE_DT_INST_DEFINE(inst, xec_i2c_nl_ctrl_init, NULL,                                    \
+			      &xec_i2c_nl_data_##inst, &xec_i2c_nl_cfg_##inst,                     \
+			      POST_KERNEL, CONFIG_I2C_INIT_PRIORITY, NULL);
 
 DT_INST_FOREACH_STATUS_OKAY(XEC_I2C_NL_CTRL_INIT)
 
@@ -2762,6 +2881,7 @@ DT_INST_FOREACH_STATUS_OKAY(XEC_I2C_NL_CTRL_INIT)
 #define DT_DRV_COMPAT microchip_xec_i2c_v3_nl_port
 
 #define XEC_I2C_NL_PORT_INIT(inst)                                                                 \
+	PM_DEVICE_DT_INST_DEFINE(inst, xec_i2c_nl_port_pm_cb);                                     \
 	PINCTRL_DT_INST_DEFINE(inst);                                                              \
 	static const struct xec_i2c_nl_port_config xec_i2c_nl_port_cfg_##inst = {                  \
 		.parent = DEVICE_DT_GET(DT_INST_PHANDLE(inst, controller)),                        \
@@ -2769,9 +2889,11 @@ DT_INST_FOREACH_STATUS_OKAY(XEC_I2C_NL_CTRL_INIT)
 		.bitrate = DT_INST_PROP_OR(inst, clock_frequency, I2C_BITRATE_STANDARD),           \
 		.port_id = (uint8_t)(DT_INST_PROP(inst, port) & 0x0FU),                            \
 		.is_default = DT_INST_PROP(inst, default_port),                                    \
+		.wakeup_source = DT_INST_PROP(inst, wakeup_source),                                \
 	};                                                                                         \
 	I2C_DEVICE_DT_INST_DEFINE(                                                                 \
-		inst, xec_i2c_nl_port_init, NULL, NULL, &xec_i2c_nl_port_cfg_##inst, POST_KERNEL,  \
+		inst, xec_i2c_nl_port_init, PM_DEVICE_DT_INST_GET(inst),                           \
+		NULL, &xec_i2c_nl_port_cfg_##inst, POST_KERNEL,                                    \
 		CONFIG_I2C_MCHP_XEC_V3_NL_PORT_INIT_PRIORITY, &xec_i2c_nl_port_api);
 
 DT_INST_FOREACH_STATUS_OKAY(XEC_I2C_NL_PORT_INIT)

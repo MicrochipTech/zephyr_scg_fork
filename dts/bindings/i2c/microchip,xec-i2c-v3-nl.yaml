@@ -19,15 +19,15 @@ properties:
     description: Hardware interrupt vector assignment.
 
   girqs:
-    type: int
+    type: array
     required: true
     description: |
-      Hardware GIRQ encoded interrupt routing. Each peripheral
-      interrupt line is routed to a GIRQ bit in the XEC ECIA.
-      The GIRQ result bits which are bitwise AND of GIRQ enable
-      and status are routed to the peripheral's NVIC input.
-      The value is the encoded GIRQ number and bit position
-      for this peripheral instance.
+      Each pair of integers in the Hardware GIRQ and bit position for
+      the peripheral's interrupt line(s). The GIRQ result bits are a
+      bitwise AND of GIRQ enable and status and are routed to the NVIC.
+      I2C controller has up to two pairs. The first pair is the run time
+      interrupt for data transfer. The optional second entry is for wake
+      from deep sleep in target mode.
 
   pcr-scr:
     type: int
