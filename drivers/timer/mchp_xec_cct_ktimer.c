@@ -211,6 +211,16 @@ static void xec_cct_isr(const void *arg)
  * an interrupt. The SoC PM/idle path calls z_sys_clock_lpm_enter() just before
  * WFI to arm a wake no later than the requested time, and z_sys_clock_lpm_exit()
  * after wake to recover how long the system actually slept.
+ *
+ * The companion is armed in auto-reload mode rather than single shot. Reaching
+ * terminal count is only the *start* of the wake: the PLL still has to relock,
+ * the SoC resume path has to run, and the PM subsystem only reaches
+ * sys_clock_idle_exit() several milliseconds later (subsys/pm/pm.c). A
+ * single-shot counter halts at zero and holds it, so that span is invisible and
+ * lpm_exit() can do no better than report the window it programmed -- which
+ * loses the wake latency from the kernel's notion of time on every deep-sleep
+ * cycle, always in the same direction. Auto-reload keeps the counter descending
+ * past zero, so the span after terminal count is measured rather than assumed.
  * ---------------------------------------------------------------------------
  */
 #ifdef CONFIG_SYSTEM_TIMER_LPM_COMPANION_HOOKS
@@ -225,8 +235,13 @@ static void xec_cct_isr(const void *arg)
 #define XEC_RTMR_CR_ARL_EN_POS 1 /* auto-reload enable */
 #define XEC_RTMR_CR_START_POS  2 /* start countdown */
 
-/* Single-shot start value: activate + start, no auto-reload (README: CR=0x05) */
-#define XEC_RTMR_CR_SINGLE_SHOT (BIT(XEC_RTMR_CR_ACTV_POS) | BIT(XEC_RTMR_CR_START_POS))
+/*
+ * Auto-reload start value: activate + auto-reload + start (README: CR=0x07).
+ * Single shot (CR=0x05) would stop the counter at terminal count, which is
+ * exactly the information lpm_exit() needs; see the block comment above.
+ */
+#define XEC_RTMR_CR_AUTO_RELOAD                                                                    \
+	(BIT(XEC_RTMR_CR_ACTV_POS) | BIT(XEC_RTMR_CR_ARL_EN_POS) | BIT(XEC_RTMR_CR_START_POS))
 
 /* Companion DT node: the always-on 32 KHz RTOS timer (accessed by macro only;
  * it must not be bound by any other driver in HOOKS mode, e.g. MCHP_XEC_RTOS_TIMER
@@ -264,6 +279,31 @@ BUILD_ASSERT(XEC_RTMR_FREQ_HZ == 32768, "LPM companion RTOS timer must run at 32
 /* Preload programmed at the last z_sys_clock_lpm_enter(), read back at exit. */
 static uint32_t xec_lpm_scheduled_ticks;
 
+/*
+ * Terminal counts seen since the last z_sys_clock_lpm_enter(), counted by the
+ * companion ISR. In auto-reload mode each one is a full programmed window that
+ * the count register no longer reflects. Normally reaches exactly 1.
+ */
+static volatile uint32_t xec_lpm_wraps;
+
+/*
+ * Has the companion latched a terminal count that the ISR has not tallied yet?
+ *
+ * The two are complementary rather than redundant: the ISR clears the GIRQ
+ * source bit as it runs, so at any instant a terminal count is visible either in
+ * xec_lpm_wraps or in this bit, never in both.
+ */
+static inline bool xec_rtmr_terminal_latched(void)
+{
+	uint32_t status = 0;
+
+	if (soc_ecia_girq_status(XEC_RTMR_GIRQ, &status) != 0) {
+		return false;
+	}
+
+	return (status & BIT(XEC_RTMR_GIRQ_POS)) != 0u;
+}
+
 static inline uint32_t xec_rtmr_us_to_ticks(uint64_t us)
 {
 	uint64_t t = (us * XEC_RTMR_US_NUM) / XEC_RTMR_US_DEN;
@@ -278,28 +318,37 @@ static inline uint32_t xec_rtmr_us_to_ticks(uint64_t us)
 	return (uint32_t)t;
 }
 
-static inline uint64_t xec_rtmr_ticks_to_us(uint32_t ticks)
+/* Takes 64-bit ticks: a reconstructed span can exceed one programmed window. */
+static inline uint64_t xec_rtmr_ticks_to_us(uint64_t ticks)
 {
-	return ((uint64_t)ticks * XEC_RTMR_US_DEN) / XEC_RTMR_US_NUM;
+	return (ticks * XEC_RTMR_US_DEN) / XEC_RTMR_US_NUM;
 }
 
 /*
- * Companion wake ISR. Its only job is to acknowledge the RTOS timer so the
- * interrupt does not re-assert after waking the core; elapsed-time recovery is
- * done in z_sys_clock_lpm_exit(). It deliberately does not call
- * sys_clock_announce() -- the CCT remains the system timer.
+ * Companion wake ISR. It acknowledges the RTOS timer so the interrupt does not
+ * re-assert after waking the core, and records that a window elapsed;
+ * elapsed-time recovery itself is done in z_sys_clock_lpm_exit(). It
+ * deliberately does not call sys_clock_announce() -- the CCT remains the system
+ * timer.
  *
- * After exiting WFI the arch idle code re-enables interrupts before
- * sys_clock_idle_exit() runs, so this handler may fire before lpm_exit(). It
- * only stops the timer and clears status; it never touches the count register,
- * which stays at its terminal value (0) for lpm_exit() to read.
+ * It must not stop the timer and must not touch the count register: the
+ * continued auto-reload descent is the only record of how long the wake took.
+ *
+ * On this SoC the handler does run before lpm_exit(): PRIMASK is cleared at the
+ * end of pm_state_exit_post_ops() (soc/microchip/mec/common/soc_pm_mgmt.c),
+ * which is ahead of the sys_clock_idle_exit() call in pm_system_resume(). The
+ * reverse order is still handled -- see xec_rtmr_terminal_latched().
+ *
+ * Clearing status *before* incrementing keeps the two signals disjoint for
+ * lpm_exit(): an observer that sees the increment is guaranteed to see the
+ * status already cleared, so summing them cannot double-count.
  */
 static void xec_lpm_companion_isr(const void *arg)
 {
 	ARG_UNUSED(arg);
 
-	sys_write32(0, XEC_RTMR_BASE + XEC_RTMR_CR_OFS);
 	soc_ecia_girq_status_clear(XEC_RTMR_GIRQ, XEC_RTMR_GIRQ_POS);
+	xec_lpm_wraps++;
 }
 
 /* One-time companion setup: quiesce, connect the wake ISR, and enable the GIRQ
@@ -324,40 +373,82 @@ void z_sys_clock_lpm_enter(uint64_t max_lpm_time_us)
 	uint32_t preload = xec_rtmr_us_to_ticks(max_lpm_time_us);
 
 	xec_lpm_scheduled_ticks = preload;
+	xec_lpm_wraps = 0u;
 
 	/* Drop any stale wake status from a previous LPM cycle. */
 	soc_ecia_girq_status_clear(XEC_RTMR_GIRQ, XEC_RTMR_GIRQ_POS);
 	NVIC_ClearPendingIRQ(XEC_RTMR_IRQ_NUM);
 
-	/* Required start sequence (README): CR=0, write preload, CR=single-shot. */
+	/* Required start sequence (README): CR=0, write preload, CR=auto-reload. */
 	sys_write32(0, base + XEC_RTMR_CR_OFS);
 	sys_write32(preload, base + XEC_RTMR_PRLD_OFS);
-	sys_write32(XEC_RTMR_CR_SINGLE_SHOT, base + XEC_RTMR_CR_OFS);
+	sys_write32(XEC_RTMR_CR_AUTO_RELOAD, base + XEC_RTMR_CR_OFS);
 }
 
 uint64_t z_sys_clock_lpm_exit(void)
 {
 	mm_reg_t base = XEC_RTMR_BASE;
-	uint32_t remaining = sys_read32(base + XEC_RTMR_CNT_OFS);
-	uint32_t elapsed_ticks;
+	uint32_t scheduled = xec_lpm_scheduled_ticks;
+	uint32_t wraps = xec_lpm_wraps;
+	uint32_t remaining, partial;
+	bool latched;
+
+	/*
+	 * Sample the wrap evidence and the counter consistently.
+	 *
+	 * The ISR cannot run here -- sys_clock_idle_exit() holds the clock lock,
+	 * so interrupts are masked and xec_lpm_wraps is frozen -- but the
+	 * *hardware* reload still can. A terminal count landing between the two
+	 * reads would pair a pre-reload counter with post-reload evidence (or the
+	 * reverse) and mis-state the span by a whole window, so re-read the
+	 * counter if the status bit moved underneath us. Only false->true is
+	 * possible, nothing being able to clear it while interrupts are masked.
+	 *
+	 * One retry is enough: reloads are `scheduled` ticks apart, which even at
+	 * the one-tick floor is far longer than this sequence. Two reloads inside
+	 * the masked resume path would go uncounted, but that needs a resume
+	 * longer than two programmed windows, and any window reaching a
+	 * PLL-stopping state is orders of magnitude above the wake latency.
+	 */
+	latched = xec_rtmr_terminal_latched();
+	remaining = sys_read32(base + XEC_RTMR_CNT_OFS);
+
+	if (!latched && xec_rtmr_terminal_latched()) {
+		latched = true;
+		remaining = sys_read32(base + XEC_RTMR_CNT_OFS);
+	}
+
+	wraps += latched ? 1u : 0u;
 
 	/* Stop the companion and clear its wake status/pending. */
 	sys_write32(0, base + XEC_RTMR_CR_OFS);
 	soc_ecia_girq_status_clear(XEC_RTMR_GIRQ, XEC_RTMR_GIRQ_POS);
 	NVIC_ClearPendingIRQ(XEC_RTMR_IRQ_NUM);
 
+	/*
+	 * Each counted terminal count is one full programmed window that the
+	 * count register no longer reflects; the descent in progress adds
+	 * `scheduled - remaining` on top of them. With no wrap this reduces to
+	 * the old woken-early arithmetic, so that case is unchanged.
+	 */
 	if (remaining == 0u) {
-		/* Reached terminal count: the full programmed window elapsed. */
-		elapsed_ticks = xec_lpm_scheduled_ticks;
-	} else if (remaining < xec_lpm_scheduled_ticks) {
-		/* Woken early by another source: elapsed = programmed - remaining. */
-		elapsed_ticks = xec_lpm_scheduled_ticks - remaining;
+		/*
+		 * Exactly at terminal count, reload not yet landed. The wrap that
+		 * produced it is already counted, so it contributes no partial --
+		 * crediting `scheduled - 0` here would count that window twice.
+		 * It is also the one reading that proves a wrap occurred, so a
+		 * zero tally means the evidence was missed; trust the counter.
+		 */
+		partial = 0u;
+		wraps = MAX(wraps, 1u);
+	} else if (remaining <= scheduled) {
+		partial = scheduled - remaining;
 	} else {
-		/* No measurable time elapsed. */
-		elapsed_ticks = 0u;
+		/* Counter above its own preload: not a span worth trusting. */
+		partial = 0u;
 	}
 
-	return xec_rtmr_ticks_to_us(elapsed_ticks);
+	return xec_rtmr_ticks_to_us((uint64_t)wraps * scheduled + partial);
 }
 
 #endif /* CONFIG_SYSTEM_TIMER_LPM_COMPANION_HOOKS */
