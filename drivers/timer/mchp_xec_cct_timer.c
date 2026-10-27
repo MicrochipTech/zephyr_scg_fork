@@ -26,9 +26,22 @@
  * So the block needs no software disable around sleep, and it is paused rather
  * than reset: the count survives, but the sleep interval is not counted. That
  * interval is recovered from the always-on 32 KHz RTOS timer through the system
- * timer low-power companion interface and added back to the counter on wake.
- * The SoC asserts SLEEP_ALL for light sleep as well as deep sleep, so this
- * applies to every power state.
+ * timer low-power companion interface. The SoC asserts SLEEP_ALL for light
+ * sleep as well as deep sleep, so this applies to every power state.
+ *
+ * The block cannot be trusted to measure any part of that interval, so the
+ * wake path reconstructs the counter from the companion alone rather than
+ * adding to what the block holds. Two reasons, both about the window between
+ * the SoC clearing SLEEP_ALL just after WFI and sys_clock_idle_exit() running:
+ *
+ *   - The block resumes counting the moment SLEEP_ALL is cleared, but the
+ *     companion has been running across that whole window too, so anything the
+ *     block counted there is already in the companion's interval and adding
+ *     both counts it twice.
+ *   - Coming out of deep sleep the PLL is off, and the chip runs on a +/-50%
+ *     ring oscillator until it locks, up to 3 ms later. The block counts that
+ *     window at an unknown rate. Light sleep keeps the PLL locked and does not
+ *     have this problem, but the fix is the same for both.
  */
 
 #define DT_DRV_COMPAT microchip_xec_cct_timer
@@ -111,10 +124,10 @@ static ALWAYS_INLINE void cct_ctrl_write(uint32_t val)
 /*
  * A compare written too close to the counter can be passed before the write
  * lands, and the equality match is then missed for a whole counter period.
- * Two cycles covers the write reaching the counter's clock domain; the core's
- * verify loop re-reads and retries from there.
+ * The core's verify loop re-reads the counter and retries from here, so this
+ * only has to cover the write reaching the counter's clock domain.
  */
-#define TIMER_CORE_ALARM_LEAD_CYCLES 2u
+#define TIMER_CORE_ALARM_LEAD_CYCLES 200u
 
 static inline uint32_t timer_driver_cycle_get(void)
 {
@@ -180,20 +193,32 @@ void sys_clock_disable(void)
 
 #if !defined(CONFIG_SYSTEM_TIMER_LPM_COMPANION_NONE)
 
+/* Free-running count as the companion was armed. The wake path rebuilds the
+ * counter from this plus the companion's interval, which is the only measure of
+ * that interval the driver can trust (see the file header).
+ */
+static uint32_t cycle_pre_idle;
+
 void sys_clock_idle_enter(uint32_t ticks)
 {
 	__ASSERT(sys_clock_is_locked(), "system clock lock not held");
 
-	/* Arm the always-on companion to wake by the deadline.
-	 * SYS_CLOCK_IDLE_FOREVER converts to a wakeup tens of days out, which is
-	 * the intent: the companion may wake earlier, never later.
+	/* The block pauses itself and drops its clock request when the SoC
+	 * asserts SLEEP_ALL, so it needs no disable here and none on the way
+	 * out, and the armed compare survives untouched. A compare that is
+	 * already pending is left pending on purpose: it marks a deadline that
+	 * really expired, and letting it abort the sleep and be serviced is
+	 * correct.
 	 *
-	 * Nothing else to do. The block pauses itself and drops its clock
-	 * request when the SoC asserts SLEEP_ALL, so it neither has to be
-	 * disabled here nor re-enabled on the way out, and the armed compare
-	 * survives untouched. A compare that is already pending is left pending
-	 * on purpose: it marks a deadline that really expired, and letting it
-	 * abort the sleep and be serviced is correct.
+	 * Sample the counter before arming so the two are as close together as
+	 * possible: the gap between them is charged to the companion's interval
+	 * and so is counted twice, and only the order keeps that to a few
+	 * register writes.
+	 */
+	cycle_pre_idle = timer_driver_cycle_get();
+
+	/* SYS_CLOCK_IDLE_FOREVER converts to a wakeup tens of days out, which is
+	 * the intent: the companion may wake earlier, never later.
 	 */
 	z_sys_clock_lpm_enter(k_ticks_to_us_ceil64(ticks));
 }
@@ -212,14 +237,17 @@ void sys_clock_idle_exit(void)
 	uint64_t slept_cycles = k_us_to_cyc_floor64(slept_us);
 
 	/*
-	 * Add the slept cycles to the counter. The core holds its announce
-	 * baseline as a 64-bit extension whose low bits must keep tracking this
-	 * counter, so the counter has to advance by the span the announce below
-	 * credits. The addend comes from the counter as it reads now, not from a
-	 * value sampled before the sleep: the block resumed from where it
-	 * paused and has been counting again since, and reusing a stale sample
-	 * would discard that and could even move the counter backwards, which
-	 * the core's wrap-masked deltas would read as an enormous elapse.
+	 * Rebuild the counter as (count when the companion was armed) + (the
+	 * companion's interval), discarding whatever the block itself counted
+	 * since SLEEP_ALL was cleared. Reading the counter here and adding to it
+	 * instead would count that window twice, and out of deep sleep it is
+	 * counted on the ring oscillator anyway, so the block's own figure for
+	 * it is worth nothing. See the file header.
+	 *
+	 * The core holds its announce baseline as a 64-bit extension whose low
+	 * bits must keep tracking this counter, so the counter must land exactly
+	 * where the announce below credits it. Truncating the sum to 32 bits is
+	 * what the core's wrap-masked deltas expect.
 	 *
 	 * Section 24.9.2.2 requires the compare disabled while the free-running
 	 * register is written, or the matcher can emit a spurious event. The
@@ -229,13 +257,13 @@ void sys_clock_idle_exit(void)
 	uint32_t ctrl = cct_ctrl_read();
 
 	cct_ctrl_write(ctrl & ~CCT_CTRL_COMPARE_ENABLE0);
-	sys_write32(timer_driver_cycle_get() + (uint32_t)slept_cycles,
-		    CCT_BASE + CCT_FREE_RUN_OFS);
+	sys_write32(cycle_pre_idle + (uint32_t)slept_cycles, CCT_BASE + CCT_FREE_RUN_OFS);
 
 	/*
-	 * Announce the whole ticks slept. The sub-tick remainder stays in the
-	 * counter, which advanced by the full span, so the next announce picks
-	 * it up along with anything left unannounced before the sleep.
+	 * Announce the whole ticks slept. The counter was placed the full span
+	 * ahead of where it was sampled, so the sub-tick remainder stays in it
+	 * and the next announce picks that up along with anything left
+	 * unannounced before the sleep.
 	 */
 	timer_core_announce_cycles64_from(key, slept_cycles);
 }
