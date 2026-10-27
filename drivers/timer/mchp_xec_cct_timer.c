@@ -17,9 +17,18 @@
  * COMPARE_EXACT backend: the core writes the comparator through a verify loop
  * that handles a deadline already in the past.
  *
- * The counter is clocked from the 48 MHz domain and stops once the SoC gates
- * the PLL in deep sleep, so deep-sleep timekeeping is handed to the always-on
- * 32 KHz RTOS timer through the system timer low-power companion interface.
+ * Low-power behaviour, measured on hardware: with ACTIVATE, FREE_ENABLE and
+ * COMPARE_ENABLE0 all set, writing the PCR Sleep Control register with
+ * SLEEP_ALL = 1 pauses the block and drops its clock request, so it does not
+ * hold the PLL up. Clearing SLEEP_ALL resumes counting from the free-running
+ * value the block held when SLEEP_ALL was set.
+ *
+ * So the block needs no software disable around sleep, and it is paused rather
+ * than reset: the count survives, but the sleep interval is not counted. That
+ * interval is recovered from the always-on 32 KHz RTOS timer through the system
+ * timer low-power companion interface and added back to the counter on wake.
+ * The SoC asserts SLEEP_ALL for light sleep as well as deep sleep, so this
+ * applies to every power state.
  */
 
 #define DT_DRV_COMPAT microchip_xec_cct_timer
@@ -48,7 +57,8 @@ BUILD_ASSERT(DT_NODE_HAS_STATUS(CCT_NODE, okay),
 #define CCT_COMPARE0_PRIO DT_INST_IRQ_BY_NAME(0, comp0, priority)
 
 /* GIRQ (number, source-bit) of the Compare 0 event. The girqs pairs follow the
- * order of interrupts, and comp0 is the eighth entry (index 7).
+ * order of interrupts, and comp0 is the eighth of them, so its pair starts at
+ * cell 14. Verified as {18, 27} in the generated devicetree.
  */
 #define CCT_GIRQ     DT_INST_PROP_BY_IDX(0, girqs, 14)
 #define CCT_GIRQ_POS DT_INST_PROP_BY_IDX(0, girqs, 15)
@@ -59,11 +69,10 @@ BUILD_ASSERT(DT_NODE_HAS_STATUS(CCT_NODE, okay),
 #define CCT_COMPARE0_OFS 0x28u
 
 /* Capture and Compare Timer Control Register, datasheet section 24.10.1. */
-#define CCT_CTRL_ACTIVATE       BIT(0)
-#define CCT_CTRL_FREE_ENABLE    BIT(1)
-#define CCT_CTRL_FREE_RESET     BIT(2)
-#define CCT_CTRL_TCLK_POS       4
-#define CCT_CTRL_TCLK_MSK       GENMASK(6, 4)
+#define CCT_CTRL_ACTIVATE        BIT(0)
+#define CCT_CTRL_FREE_ENABLE     BIT(1)
+#define CCT_CTRL_FREE_RESET      BIT(2)
+#define CCT_CTRL_TCLK_POS        4
 #define CCT_CTRL_COMPARE_ENABLE0 BIT(8)
 
 /* Counter rate after the TCLK divider. TCLK selects a power-of-two divide of
@@ -171,33 +180,22 @@ void sys_clock_disable(void)
 
 #if !defined(CONFIG_SYSTEM_TIMER_LPM_COMPANION_NONE)
 
-/* Free-running count captured on idle entry. The counter is restored from this
- * plus the slept interval on wake, which keeps it in step with the core's
- * announce baseline (see sys_clock_idle_exit()).
- */
-static uint32_t cycle_pre_idle;
-
 void sys_clock_idle_enter(uint32_t ticks)
 {
 	__ASSERT(sys_clock_is_locked(), "system clock lock not held");
 
-	/* SYS_CLOCK_IDLE_FOREVER converts to a wakeup tens of days out, which
-	 * is the intent: the companion may wake earlier, never later.
+	/* Arm the always-on companion to wake by the deadline.
+	 * SYS_CLOCK_IDLE_FOREVER converts to a wakeup tens of days out, which is
+	 * the intent: the companion may wake earlier, never later.
+	 *
+	 * Nothing else to do. The block pauses itself and drops its clock
+	 * request when the SoC asserts SLEEP_ALL, so it neither has to be
+	 * disabled here nor re-enabled on the way out, and the armed compare
+	 * survives untouched. A compare that is already pending is left pending
+	 * on purpose: it marks a deadline that really expired, and letting it
+	 * abort the sleep and be serviced is correct.
 	 */
 	z_sys_clock_lpm_enter(k_ticks_to_us_ceil64(ticks));
-
-	/*
-	 * The counter is clocked from the PLL and stops once deep sleep gates
-	 * it, so it cannot measure the sleep. Snapshot it here and stop the
-	 * block: section 24.7 says the block only becomes inactive, and so
-	 * drops its clock request, once ACTIVATE is de-asserted or its SLEEP_EN
-	 * is asserted. A pending compare interrupt would inhibit low-power
-	 * entry, so drop that too.
-	 */
-	cycle_pre_idle = timer_driver_cycle_get();
-	sys_clock_disable();
-	soc_ecia_girq_status_clear(CCT_GIRQ, CCT_GIRQ_POS);
-	NVIC_ClearPendingIRQ(CCT_COMPARE0_IRQ);
 }
 
 void sys_clock_idle_exit(void)
@@ -205,36 +203,39 @@ void sys_clock_idle_exit(void)
 	k_spinlock_key_t key = sys_clock_lock();
 
 	/*
-	 * The counter measured nothing while it was stopped, so the slept
-	 * interval comes entirely from the companion. It is taken in cycles
-	 * because a deep sleep can outrun a 32-bit cycle count (89 s at
+	 * The block was paused across the low-power state, so it did not count
+	 * the sleep: the whole interval comes from the companion. It is taken in
+	 * cycles because a sleep can outrun a 32-bit cycle count (89 s at
 	 * 48 MHz).
 	 */
 	uint64_t slept_us = z_sys_clock_lpm_exit();
 	uint64_t slept_cycles = k_us_to_cyc_floor64(slept_us);
 
 	/*
-	 * Restart the counter at where it stopped plus the slept cycles rather
-	 * than from zero. The core holds its announce baseline as a 64-bit
-	 * extension whose low bits must keep tracking this counter, so the
-	 * counter has to advance by the same span the announce below credits.
-	 * Truncating the sum to 32 bits is what the core's wrap-masked deltas
-	 * expect. Section 24.9.2.2 requires the compare disabled while the
-	 * free-running register is written, which it still is from idle entry.
+	 * Add the slept cycles to the counter. The core holds its announce
+	 * baseline as a 64-bit extension whose low bits must keep tracking this
+	 * counter, so the counter has to advance by the span the announce below
+	 * credits. The addend comes from the counter as it reads now, not from a
+	 * value sampled before the sleep: the block resumed from where it
+	 * paused and has been counting again since, and reusing a stale sample
+	 * would discard that and could even move the counter backwards, which
+	 * the core's wrap-masked deltas would read as an enormous elapse.
+	 *
+	 * Section 24.9.2.2 requires the compare disabled while the free-running
+	 * register is written, or the matcher can emit a spurious event. The
+	 * kernel re-arms the deadline right after this returns, which enables
+	 * the compare again.
 	 */
-	cct_ctrl_write((CCT_TCLK_SEL << CCT_CTRL_TCLK_POS) | CCT_CTRL_ACTIVATE);
-	sys_write32(cycle_pre_idle + (uint32_t)slept_cycles, CCT_BASE + CCT_FREE_RUN_OFS);
-	cct_ctrl_write((CCT_TCLK_SEL << CCT_CTRL_TCLK_POS) | CCT_CTRL_FREE_ENABLE |
-		       CCT_CTRL_ACTIVATE);
+	uint32_t ctrl = cct_ctrl_read();
 
-	soc_ecia_girq_ctrl(CCT_GIRQ, CCT_GIRQ_POS, MCHP_MEC_ECIA_GIRQ_EN);
-	irq_enable(CCT_COMPARE0_IRQ);
+	cct_ctrl_write(ctrl & ~CCT_CTRL_COMPARE_ENABLE0);
+	sys_write32(timer_driver_cycle_get() + (uint32_t)slept_cycles,
+		    CCT_BASE + CCT_FREE_RUN_OFS);
 
 	/*
 	 * Announce the whole ticks slept. The sub-tick remainder stays in the
-	 * counter, which was advanced by the full span, so the next announce
-	 * picks it up. The comparator no longer holds the deadline the core
-	 * last armed; the kernel reprograms it right after this returns.
+	 * counter, which advanced by the full span, so the next announce picks
+	 * it up along with anything left unannounced before the sleep.
 	 */
 	timer_core_announce_cycles64_from(key, slept_cycles);
 }

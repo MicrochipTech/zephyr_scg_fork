@@ -16,32 +16,28 @@ config MCHP_XEC_CCT_TIMER
 	  Compare 0 is the tick deadline, giving a high resolution kernel timer
 	  from a single hardware block.
 
-	  The counter runs on the PLL clock domain and stops in deep sleep, so
-	  low-power timekeeping is delegated to the always-on 32 KHz RTOS timer
-	  through the system timer low-power companion interface.
+	  The block pauses while the SoC asserts SLEEP_ALL, so it does not count
+	  the sleep interval. That interval is recovered from the always-on
+	  32 KHz RTOS timer through the system timer low-power companion
+	  interface.
 
 if MCHP_XEC_CCT_TIMER
 
-# The free-running counter is gated with the PLL in deep sleep, so it cannot
-# keep time there. The generic SYSTEM_TIMER_LPM_COMPANION choice (see
-# Kconfig.system_timer_lpm) selects how timekeeping is handed over:
+# The block pauses, and drops its clock request, while the SoC asserts
+# SLEEP_ALL, so it does not count the sleep interval (measured on hardware; the
+# count itself survives). That interval is recovered from a low-power companion
+# selected by the generic SYSTEM_TIMER_LPM_COMPANION choice, see
+# Kconfig.system_timer_lpm:
 #
-#   * COMPANION_HOOKS   - this driver drives the always-on RTOS timer directly.
-#                         Requires "rtos" entries in reg and interrupts.
-#                         This is the only workable mode today: the RTOS timer
-#                         has no Counter API driver, and the generic counter
-#                         hooks only handle up-counting timers.
+#   * COMPANION_HOOKS   - this driver drives the always-on RTOS timer named by
+#                         the node's companion-timer phandle. The only workable
+#                         mode today: the RTOS timer has no Counter API driver,
+#                         and the generic counter hooks only handle up-counting
+#                         timers while the RTOS timer counts down.
 #   * COMPANION_COUNTER - a Counter API device named by
 #                         chosen { zephyr,system-timer-companion }.
-config MCHP_XEC_CCT_TIMER_RESET_BY_LPM
-	bool "Free-running counter loses time in deep sleep"
-	default y
-	depends on !SYSTEM_TIMER_LPM_COMPANION_NONE
-	select SYSTEM_TIMER_RESET_BY_LPM
-	help
-	  Select when the platform may enter a deep-sleep state that gates the
-	  PLL feeding the capture/compare block. The driver then stops the
-	  counter on idle entry and recovers the slept interval from the
-	  companion on wake.
+#
+# SYSTEM_TIMER_RESET_BY_LPM is deliberately NOT selected: it describes a timer
+# placed under reset by the low-power mode, and this block is only paused.
 
 endif # MCHP_XEC_CCT_TIMER

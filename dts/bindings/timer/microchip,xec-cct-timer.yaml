@@ -11,10 +11,10 @@ description: |
   free-running counter as the cycle source and Compare 0 as the tick deadline,
   so a single block serves both roles.
 
-  The counter lives on the PLL clock domain and stops when the SoC gates the
-  PLL in deep sleep. Deep-sleep timekeeping is therefore delegated to the
-  always-on 32 KHz RTOS timer through the system timer low-power companion
-  interface. See CONFIG_MCHP_XEC_CCT_TIMER.
+  The block pauses, and drops its clock request, while the SoC asserts the PCR
+  SLEEP_ALL bit, resuming from the same count afterwards. It therefore does not
+  count the sleep interval, which is recovered from the always-on 32 KHz RTOS
+  timer named by companion-timer. See CONFIG_MCHP_XEC_CCT_TIMER.
 
 compatible: "microchip,xec-cct-timer"
 
@@ -51,8 +51,9 @@ properties:
   companion-timer:
     type: phandle
     description: |
-      The always-on timer that keeps time while this block is gated in deep
-      sleep, used when CONFIG_SYSTEM_TIMER_LPM_COMPANION_HOOKS is selected.
+      The always-on timer that keeps time while this block is paused in a
+      low-power state, used when CONFIG_SYSTEM_TIMER_LPM_COMPANION_HOOKS is
+      selected.
       Must point at a microchip,xec-rtos-timer node. The referenced node stays
       disabled: this driver owns the hardware and the RTOS-timer kernel timer
       driver must not also be built.
