@@ -12,18 +12,41 @@ config NUM_IRQS
 	default 198
 
 config CORTEX_M_SYSTICK
-	depends on !MCHP_XEC_RTOS_TIMER
+	depends on !MCHP_XEC_RTOS_TIMER && !MCHP_XEC_CCT_TIMER
 
 config SYS_CLOCK_HW_CYCLES_PER_SEC
 	default $(dt_node_int_prop_int,/cpus/cpu@0,clock-frequency) if CORTEX_M_SYSTICK
 	default $(dt_node_int_prop_int,/soc/timer@40007400,clock-frequency) if MCHP_XEC_RTOS_TIMER
+	default $(dt_node_int_prop_int,/soc/timer@40001000,clock-frequency) if MCHP_XEC_CCT_TIMER
 
 if MCHP_XEC_RTOS_TIMER
 config SYS_CLOCK_TICKS_PER_SEC
 	default $(dt_node_int_prop_int,/soc/timer@40007400,clock-frequency)
 endif # MCHP_XEC_RTOS_TIMER
 
+if MCHP_XEC_CCT_TIMER
+
+# The capture/compare counter runs far faster than the RTOS timer, so the tick
+# rate is not tied to the counter rate here. 10 kHz leaves 4800 cycles per tick
+# at 48 MHz.
+config SYS_CLOCK_TICKS_PER_SEC
+	default 10000
+
+# The generic choice defaults to the Counter API companion, which cannot be
+# satisfied here: the RTOS timer has no Counter driver, and the generic counter
+# hooks only handle up-counting timers. Without this the choice falls back to
+# NONE and deep sleep would silently lose time.
+choice SYSTEM_TIMER_LPM_COMPANION
+	default SYSTEM_TIMER_LPM_COMPANION_HOOKS
+endchoice
+
+endif # MCHP_XEC_CCT_TIMER
+
+# The RTOS timer's 32 KHz tick is too coarse to spin on, so that driver borrows
+# a Basic Timer for k_busy_wait(). The capture/compare kernel timer needs no
+# such help: its cycle counter resolves to about 21 ns at 48 MHz, which the
+# generic k_busy_wait() reads directly.
 config ARCH_HAS_CUSTOM_BUSY_WAIT
-	default y
+	default y if !MCHP_XEC_CCT_TIMER
 
 endif # SOC_SERIES_MEC175X
