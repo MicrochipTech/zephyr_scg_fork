@@ -385,6 +385,7 @@
 		};
 
 		cctmr0: timer@40001000 {
+			compatible = "microchip,xec-cct-timer";
 			reg = <0x40001000 0x40>;
 			interrupts = <146 0>, <147 0>, <148 0>, <149 0>,
 				     <150 0>, <151 0>, <152 0>, <153 0>, <154 0>;
@@ -392,6 +393,9 @@
 					  "cap4", "cap5", "comp0", "comp1";
 			girqs = <18 20>, <18 21>, <18 22>, <18 23>,
 				<18 24>, <18 25>, <18 26>, <18 27>, <18 28>;
+			pcr-src = <MCHP_XEC_SCR_ENCODE(3, 30)>;
+			clock-frequency = <48000000>;
+			companion-timer = <&rtimer>;
 			status = "disabled";
 		};
 

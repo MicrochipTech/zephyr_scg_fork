@@ -1,0 +1,68 @@
+# Copyright (c) 2026 Microchip Technology Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Microchip XEC Input Capture and Compare Timer (CCT) used as the Zephyr kernel
+  system timer.
+
+  The block provides a free-running 32-bit up-counter clocked from a divider off
+  the 48 MHz domain, plus two 32-bit compare registers that raise an interrupt
+  when the free-running counter matches. The kernel timer driver uses the
+  free-running counter as the cycle source and Compare 0 as the tick deadline,
+  so a single block serves both roles.
+
+  The counter lives on the PLL clock domain and stops when the SoC gates the
+  PLL in deep sleep. Deep-sleep timekeeping is therefore delegated to the
+  always-on 32 KHz RTOS timer through the system timer low-power companion
+  interface. See CONFIG_MCHP_XEC_CCT_TIMER.
+
+compatible: "microchip,xec-cct-timer"
+
+include:
+  - "base.yaml"
+  - "microchip,dmec-ecia-girq.yaml"
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+    description: |
+      All block interrupts. The kernel timer driver uses only "comp0"; the
+      capture and counter-overflow interrupts are left unconnected.
+
+  interrupt-names:
+    required: true
+    description: Must include "comp0".
+
+  girqs:
+    required: true
+    description: |
+      One GIRQ (number, source-bit) pair per entry in interrupts, in the same
+      order, as described by microchip,dmec-ecia-girq.yaml.
+
+  pcr-src:
+    type: int
+    description: |
+      Power, Clocks and Reset (PCR) sleep-enable index and bit position for
+      this block, encoded with MCHP_XEC_SCR_ENCODE().
+
+  companion-timer:
+    type: phandle
+    description: |
+      The always-on timer that keeps time while this block is gated in deep
+      sleep, used when CONFIG_SYSTEM_TIMER_LPM_COMPANION_HOOKS is selected.
+      Must point at a microchip,xec-rtos-timer node. The referenced node stays
+      disabled: this driver owns the hardware and the RTOS-timer kernel timer
+      driver must not also be built.
+
+  clock-frequency:
+    type: int
+    required: true
+    description: |
+      Rate, in Hz, of the free-running counter after the TCLK divider. The
+      hardware divides 48 MHz by a power of two, so this must be one of
+      48000000, 24000000, 12000000, 6000000, 3000000, 1500000, 750000 or
+      375000. This is the kernel timer's cycle rate and must equal
+      CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC.
