@@ -346,6 +346,12 @@ void z_sys_clock_lpm_enter(uint64_t max_lpm_time_us)
 	sys_write32(0, RTOS_BASE + RTOS_CTRL_OFS);
 	sys_write32(counts, RTOS_BASE + RTOS_PRLD_OFS);
 	rtos_armed_counts = counts;
+
+	/* Clear any stale latch and re-enable the source, which the ISR masks
+	 * and the previous exit may have left masked.
+	 */
+	soc_ecia_girq_status_clear(RTOS_GIRQ, RTOS_GIRQ_POS);
+	soc_ecia_girq_ctrl(RTOS_GIRQ, RTOS_GIRQ_POS, MCHP_MEC_ECIA_GIRQ_EN);
 	sys_write32(RTOS_CTRL_ACTIVATE, RTOS_BASE + RTOS_CTRL_OFS);
 	sys_write32(RTOS_CTRL_ACTIVATE | RTOS_CTRL_START, RTOS_BASE + RTOS_CTRL_OFS);
 }
@@ -383,28 +389,46 @@ uint64_t z_sys_clock_lpm_exit(void)
 		counts = 0u;
 	}
 
+	/* Stop the timer and leave the source masked and the latch clear: the
+	 * companion is only of interest inside a sleep, and the next
+	 * z_sys_clock_lpm_enter() re-enables it.
+	 */
 	sys_write32(0, RTOS_BASE + RTOS_CTRL_OFS);
+	soc_ecia_girq_ctrl(RTOS_GIRQ, RTOS_GIRQ_POS, MCHP_MEC_ECIA_GIRQ_DIS);
 	soc_ecia_girq_status_clear(RTOS_GIRQ, RTOS_GIRQ_POS);
 
 	return ((uint64_t)counts * USEC_PER_SEC) / RTOS_HZ;
 }
 
-/* The RTOS timer event has no status bit in the block; it is latched only in
- * the GIRQ source register. The time accounting is done by
- * z_sys_clock_lpm_exit(), so the wake only has to be acknowledged.
+/*
+ * The RTOS timer event has no status bit in the block; it is latched only in
+ * the GIRQ source register, and z_sys_clock_lpm_exit() reads that latch to tell
+ * a completed countdown from a wake that beat the preload (both leave the count
+ * register reading zero). So this must NOT clear the latch: the SoC unmasks
+ * interrupts in pm_state_exit_post_ops(), which runs before
+ * sys_clock_idle_exit(), so on a timer-driven wake this ISR fires first and
+ * clearing here would destroy the evidence and credit a full-interval sleep as
+ * zero.
+ *
+ * Mask the source at the aggregator instead. That drops the level so the vector
+ * does not re-enter while the latch stands, leaving z_sys_clock_lpm_exit() to
+ * read it, clear it, and re-enable the source on the next arm.
  */
 static void rtos_timer_isr(const void *arg)
 {
 	ARG_UNUSED(arg);
 
-	soc_ecia_girq_status_clear(RTOS_GIRQ, RTOS_GIRQ_POS);
+	soc_ecia_girq_ctrl(RTOS_GIRQ, RTOS_GIRQ_POS, MCHP_MEC_ECIA_GIRQ_DIS);
 }
 
 static void rtos_companion_init(void)
 {
+	/* Left stopped, with the aggregator source masked and the latch clear.
+	 * z_sys_clock_lpm_enter() enables the source when it arms the timer.
+	 */
 	sys_write32(0, RTOS_BASE + RTOS_CTRL_OFS);
+	soc_ecia_girq_ctrl(RTOS_GIRQ, RTOS_GIRQ_POS, MCHP_MEC_ECIA_GIRQ_DIS);
 	soc_ecia_girq_status_clear(RTOS_GIRQ, RTOS_GIRQ_POS);
-	soc_ecia_girq_ctrl(RTOS_GIRQ, RTOS_GIRQ_POS, MCHP_MEC_ECIA_GIRQ_EN);
 	IRQ_CONNECT(RTOS_IRQ, RTOS_PRIO, rtos_timer_isr, NULL, 0);
 	irq_enable(RTOS_IRQ);
 }
