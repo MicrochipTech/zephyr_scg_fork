@@ -104,20 +104,23 @@ static void soc_deep_sleep_periph_restore(void)
  * Enable CM4 deep sleep and sleep signals assertion on WFI.
  * Set MCHP Heavy sleep (PLL OFF when all CLK_REQ clear) and SLEEP_ALL
  * to assert SLP_EN to all peripherals on WFI.
- * Set PRIMASK = 1 so on wake the CPU will not vector to any ISR.
- * Set BASEPRI = 0 to allow any priority to wake.
- * WFI triggers MEC HW to enter deep sleep
- * On wake
- * Clear SLEEP_ALL manually since we are not vectoring to an ISR until
- * PM post ops. This de-asserts peripheral SLP_EN signals.
+ * WFI triggers MEC HW to enter deep sleep.
+ * On wake clear SLEEP_ALL manually, de-asserting peripheral SLP_EN, since no
+ * ISR runs until the kernel idle thread restores the interrupt state.
+ *
+ * Interrupt masking around WFI is the architecture's job:
+ * arch_pm_state_set_prepare() saves BASEPRI, sets PRIMASK so no ISR is entered
+ * on wake, and clears BASEPRI so any enabled interrupt can wake the CPU.
+ * arch_pm_state_set_finish() restores the saved BASEPRI and clears PRIMASK. It
+ * is called only after the PLL has locked and peripherals are restored: ISRs
+ * must not run while the chip is still on the ring oscillator.
  */
 static void z_power_soc_deep_sleep(void)
 {
 	mm_reg_t pcrbase = (mm_reg_t)(XEC_PCR_REG_BASE);
 	uint32_t msk = BIT(XEC_PCR_SLP_CR_DEEP_SLP_POS) | BIT(XEC_PCR_SLP_CR_ALL_POS);
 	uint32_t val = BIT(XEC_PCR_SLP_CR_DEEP_SLP_POS) | BIT(XEC_PCR_SLP_CR_ALL_POS);
-
-	__disable_irq();
+	unsigned int key;
 
 	soc_deep_sleep_periph_save();
 
@@ -125,8 +128,8 @@ static void z_power_soc_deep_sleep(void)
 
 	soc_mmcr_mask_set(pcrbase + XEC_PCR_SLP_CR_OFS, val, msk);
 
-	__set_BASEPRI(0);
-	__DSB();
+	key = arch_pm_state_set_prepare();
+
 	__WFI(); /* triggers sleep hardware */
 	__NOP();
 	__NOP();
@@ -135,42 +138,46 @@ static void z_power_soc_deep_sleep(void)
 
 	SCB->SCR &= ~BIT(SCB_SCR_SLEEPDEEP_Pos);
 
-	/* Wait for PLL to lock */
+	/* Wait for PLL to lock. The chip runs on a +/-50% ring oscillator until
+	 * it does, so nothing timing-dependent may run before this completes.
+	 */
 	while (sys_test_bit(pcrbase + XEC_PCR_OSC_ID_OFS, XEC_PCR_OSC_ID_PLL_LOCK_POS) == 0) {
 		__NOP();
 	}
 
 	soc_deep_sleep_periph_restore();
+
+	arch_pm_state_set_finish(key);
 }
 
-/* NOTE: Zephyr kernel does not block all interrupts.
- * We use compiler instrisic to disable all interrupts except unmaskable
- * and highest priority hard faults.
- * Clear Cortex-M4 deep sleep enable.
- * Set MEC PCR SLEEP_ALL bit to 1
- * Clear Cortex-M4 NIVC base priority to block immediate ISR entry on wake.
- * Issue wait for interrupt
- * On wake clear PCR SLEEP_ALL bit.
+/*
+ * Light sleep: clear Cortex-M deep sleep enable, set MEC PCR SLEEP_ALL to
+ * assert SLP_EN to peripherals, WFI, then clear SLEEP_ALL on wake. The PLL
+ * stays on, so clocks are already normal when the CPU resumes.
+ *
+ * Interrupt masking around WFI is handled by the architecture helpers, as in
+ * z_power_soc_deep_sleep() above.
  */
 static void z_power_soc_sleep(void)
 {
 	mm_reg_t pcrbase = (mm_reg_t)(XEC_PCR_REG_BASE);
 	uint32_t msk = BIT(XEC_PCR_SLP_CR_DEEP_SLP_POS) | BIT(XEC_PCR_SLP_CR_ALL_POS);
 	uint32_t val = BIT(XEC_PCR_SLP_CR_ALL_POS);
-
-	__disable_irq();
+	unsigned int key;
 
 	SCB->SCR &= ~BIT(SCB_SCR_SLEEPDEEP_Pos);
 
 	soc_mmcr_mask_set(pcrbase + XEC_PCR_SLP_CR_OFS, val, msk);
 
-	__set_BASEPRI(0);
-	__DSB();
+	key = arch_pm_state_set_prepare();
+
 	__WFI(); /* triggers sleep hardware */
 	__NOP();
 	__NOP();
 
 	soc_mmcr_mask_set(pcrbase + XEC_PCR_SLP_CR_OFS, 0, msk);
+
+	arch_pm_state_set_finish(key);
 }
 
 /*
@@ -204,16 +211,14 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
 }
 
 /*
- * Zephyr PM code expects us to enabled interrupt at post op exit. Zephyr used
- * arch_irq_lock() which sets BASEPRI to a non-zero value masking interrupts at
- * >= numerical priority. MCHP z_power_soc_(deep)_sleep sets PRIMASK=1 and BASEPRI=0
- * allowing wake from any enabled interrupt and prevents the CPU from entering any
- * ISR on wake except for faults. We re-enable interrupts by undoing global disable
- * and alling irq_unlock with the same value, 0 zephyr core uses.
+ * Hardware resume work only. Interrupt state is not touched here: the
+ * architecture helpers in z_power_soc_sleep() and z_power_soc_deep_sleep()
+ * own the masking around WFI, and the kernel idle thread restores the lock it
+ * took before pm_system_suspend(). All MEC hardware resume work is already
+ * done by the time the sleep functions return, so there is nothing left to do.
  */
 void pm_state_exit_post_ops(enum pm_state state, uint8_t substate_id)
 {
-	__enable_irq();
-	__ISB();
-	irq_unlock(0);
+	ARG_UNUSED(state);
+	ARG_UNUSED(substate_id);
 }
