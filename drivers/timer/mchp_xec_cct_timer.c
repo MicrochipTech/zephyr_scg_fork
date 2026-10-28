@@ -404,11 +404,16 @@ uint64_t z_sys_clock_lpm_exit(void)
  * The RTOS timer event has no status bit in the block; it is latched only in
  * the GIRQ source register, and z_sys_clock_lpm_exit() reads that latch to tell
  * a completed countdown from a wake that beat the preload (both leave the count
- * register reading zero). So this must NOT clear the latch: the SoC unmasks
- * interrupts in pm_state_exit_post_ops(), which runs before
- * sys_clock_idle_exit(), so on a timer-driven wake this ISR fires first and
- * clearing here would destroy the evidence and credit a full-interval sleep as
- * zero.
+ * register reading zero). So this must NOT clear the latch, or a timer-driven
+ * wake whose ISR runs before sys_clock_idle_exit() would destroy the evidence
+ * and credit a full-interval sleep as zero.
+ *
+ * Whether the ISR does run first depends on where the platform restores the
+ * interrupt state: before sys_clock_idle_exit() (a legacy
+ * PM_STATE_SET_IRQ_UNLOCKED platform unmasking from pm_state_exit_post_ops())
+ * or after it (the kernel idle thread, once PM resume housekeeping is done).
+ * Not clearing the latch here is correct either way, so the driver does not
+ * depend on which it is.
  *
  * Mask the source at the aggregator instead. That drops the level so the vector
  * does not re-enter while the latch stands, leaving z_sys_clock_lpm_exit() to
