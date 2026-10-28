@@ -320,6 +320,19 @@ void z_sys_clock_lpm_enter(uint64_t max_lpm_time_us)
 	const uint64_t max_us = ((uint64_t)UINT32_MAX * USEC_PER_SEC) / RTOS_HZ;
 	uint32_t counts;
 
+	/*
+	 * A one-shot down-counter halts at 0 rather than wrapping, so it cannot
+	 * measure a sleep longer than the interval it was armed for: the
+	 * overshoot is lost and uptime falls behind by that much. Arming the
+	 * full range for an unbounded idle keeps that bound as far out as the
+	 * hardware allows, 2^32 / 32768 = 131072 s, about 36 hours.
+	 *
+	 * Nothing here can do better: the kernel's own deadline is what bounds
+	 * a non-forever sleep, and a wake source other than this timer ends the
+	 * sleep before the bound matters. A SYS_CLOCK_IDLE_FOREVER idle with no
+	 * other wake source is the one case that can reach it, and it is also
+	 * the case where the kernel has already accepted uptime drift.
+	 */
 	if (max_lpm_time_us >= max_us) {
 		counts = UINT32_MAX;
 	} else {
@@ -340,13 +353,35 @@ void z_sys_clock_lpm_enter(uint64_t max_lpm_time_us)
 uint64_t z_sys_clock_lpm_exit(void)
 {
 	uint32_t cnt = sys_read32(RTOS_BASE + RTOS_CNT_OFS);
+	uint32_t girq_src = 0;
 	uint32_t counts;
 
-	/* Down-counter, halted at zero with AUTO_RELOAD clear. A count above
-	 * what was armed means the preload had not yet reached the count
-	 * register when the wake arrived, so nothing had elapsed.
+	/* The count register reads 0 in two different situations, so it alone
+	 * cannot say how long the timer ran:
+	 *
+	 *   - The timer reached 0 and halted (one-shot, AUTO_RELOAD clear). It
+	 *     ran for the full armed interval, and because it halts rather than
+	 *     wrapping, any sleep longer than that interval also reads 0: the
+	 *     timer stops measuring and the overshoot is unknowable from this
+	 *     block. Section 26.8.
+	 *   - The wake arrived so early that the preload had not yet reached the
+	 *     count register, which takes up to one 32 KHz clock. Nothing had
+	 *     elapsed.
+	 *
+	 * The interrupt event, latched in the GIRQ source register, tells the
+	 * two apart: it is asserted only on the 1 -> 0 transition while counting
+	 * (section 26.9, RTOS_TIMER source). Read it before clearing it below.
 	 */
-	counts = (cnt <= rtos_armed_counts) ? (rtos_armed_counts - cnt) : 0u;
+	(void)soc_ecia_girq_status(RTOS_GIRQ, &girq_src);
+
+	if (cnt == 0u) {
+		counts = (girq_src & BIT(RTOS_GIRQ_POS)) ? rtos_armed_counts : 0u;
+	} else if (cnt <= rtos_armed_counts) {
+		counts = rtos_armed_counts - cnt;
+	} else {
+		/* Above what was armed: the preload had not landed yet. */
+		counts = 0u;
+	}
 
 	sys_write32(0, RTOS_BASE + RTOS_CTRL_OFS);
 	soc_ecia_girq_status_clear(RTOS_GIRQ, RTOS_GIRQ_POS);
