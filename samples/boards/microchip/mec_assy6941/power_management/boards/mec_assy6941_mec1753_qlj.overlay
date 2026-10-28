@@ -1,0 +1,9 @@
+/*
+ * Copyright (c) Microchip Technology Inc.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+&pcr {
+	pinctrl-0 = <&tst_clk_out_gpio060>;
+	pinctrl-names = "default";
+};
