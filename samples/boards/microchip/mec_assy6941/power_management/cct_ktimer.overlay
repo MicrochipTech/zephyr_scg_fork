@@ -1,0 +1,23 @@
+/*
+ * Copyright (c) Microchip Technology Inc.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Use the capture-compare timer driver as the Zephyr kernel timer in
+ * place of the RTOS timer.
+ */
+
+/* The RTOS timer stays disabled so its kernel timer driver is not built.
+ * The capture-compare timer driver makes use of the RTOS timer HW directly
+ * as its low power companion when PM is enabled in the build.
+ */
+&rtimer {
+	status = "disabled";
+};
+
+&systick {
+	status = "disabled";
+}
+
+&cctmr0 {
+	status = "okay";
+};
