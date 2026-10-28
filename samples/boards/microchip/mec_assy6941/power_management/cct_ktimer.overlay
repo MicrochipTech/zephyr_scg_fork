@@ -16,7 +16,7 @@
 
 &systick {
 	status = "disabled";
-}
+};
 
 &cctmr0 {
 	status = "okay";
