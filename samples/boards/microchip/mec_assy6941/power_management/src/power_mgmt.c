@@ -27,8 +27,16 @@ LOG_MODULE_DECLARE(mec_assy6941_pm, LOG_LEVEL_INF);
 #define THREAD_A_SLEEP_TIME 100U
 #define THREAD_B_SLEEP_TIME 1000U
 
-/* Entry latency budget, in milliseconds. */
-#define MAX_EXPECTED_MS_LATENCY 500U
+/*
+ * Entry latency budget, in milliseconds.
+ *
+ * Latency here is measured from the application's trigger marker to the PM
+ * core entering the state, so it includes however long the system stays busy
+ * first. The logging thread runs every CONFIG_LOG_PROCESS_THREAD_SLEEP_MS and
+ * each of its wakeups defers entry, so the budget has to clear that period or
+ * it flags ordinary behaviour. One period plus a margin for the work itself.
+ */
+#define MAX_EXPECTED_MS_LATENCY (CONFIG_LOG_PROCESS_THREAD_SLEEP_MS + 500)
 
 /* Slept past each state's minimum residency so the policy selects it. */
 #define DP_EXTRA_SLP_TIME 1100U
@@ -52,6 +60,26 @@ K_THREAD_STACK_DEFINE(stack_b, TASK_STACK_SIZE);
 
 static struct k_thread thread_a_id;
 static struct k_thread thread_b_id;
+
+/*
+ * Pause handshake for the worker threads.
+ *
+ * k_thread_suspend() does not cancel a pending timeout: halt_thread() aborts
+ * one only for _THREAD_DEAD (kernel/sched.c). A thread suspended part-way
+ * through k_msleep() keeps that timeout live, so the kernel wakes to service
+ * it and the sleep under test ends early or is never entered at the depth
+ * requested. That is what limited this sample to 3 of 5 light and 2 of 5 deep
+ * sleeps.
+ *
+ * Instead each worker parks itself on a semaphore with K_FOREVER, which
+ * registers no timeout at all (z_add_timeout() returns immediately for
+ * K_FOREVER), and the caller waits on a second semaphore until both have
+ * parked. k_wakeup() cuts short a worker that is mid-k_msleep(), and unlike
+ * suspend it does abort the timeout.
+ */
+static bool run_threads;
+static struct k_sem parked_sem;
+static struct k_sem resume_sem;
 
 struct pm_counter {
 	uint8_t entry_cnt;
@@ -120,18 +148,13 @@ static void pm_marker_set(uint8_t idx, bool active)
 static void pm_latency_check(void)
 {
 	int64_t latency = k_uptime_delta(&trigger_time);
-	int secs = (int)(latency / SEC_TO_MSEC);
-	int msecs = (int)(latency % SEC_TO_MSEC);
 
-	LOG_INF("PM sleep entry latency %d.%03d seconds", secs, msecs);
+	LOG_INF("PM sleep entry latency %d.%03d seconds", (int)(latency / SEC_TO_MSEC),
+		(int)(latency % SEC_TO_MSEC));
 
-	if (secs > 0) {
-		LOG_WRN("Sleep entry latency is too high");
-		return;
-	}
-
-	if (msecs > (int)MAX_EXPECTED_MS_LATENCY) {
-		LOG_WRN("Sleep entry latency is higher than expected");
+	if (latency > (int64_t)MAX_EXPECTED_MS_LATENCY) {
+		LOG_WRN("Sleep entry latency is higher than expected (budget %d ms)",
+			(int)MAX_EXPECTED_MS_LATENCY);
 	}
 }
 
@@ -283,16 +306,34 @@ int test_pwr_mgmt_check_uptime(void)
 	return 0;
 }
 
+static void task_thread(uint32_t period_ms, char marker)
+{
+	while (true) {
+		if (!run_threads) {
+			/* Park holding no timeout: K_FOREVER adds none, so
+			 * nothing of this thread's can wake the system while
+			 * the sleep under test runs.
+			 */
+			k_sem_give(&parked_sem);
+			(void)k_sem_take(&resume_sem, K_FOREVER);
+			continue;
+		}
+
+		k_msleep(period_ms);
+
+		if (run_threads) {
+			printk("%c", marker);
+		}
+	}
+}
+
 static void task_a_thread(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	while (true) {
-		k_msleep(THREAD_A_SLEEP_TIME);
-		printk("A");
-	}
+	task_thread(THREAD_A_SLEEP_TIME, 'A');
 }
 
 static void task_b_thread(void *p1, void *p2, void *p3)
@@ -301,14 +342,15 @@ static void task_b_thread(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	while (true) {
-		k_msleep(THREAD_B_SLEEP_TIME);
-		printk("B");
-	}
+	task_thread(THREAD_B_SLEEP_TIME, 'B');
 }
 
 static void create_tasks(void)
 {
+	k_sem_init(&parked_sem, 0, 2);
+	k_sem_init(&resume_sem, 0, 2);
+	run_threads = true;
+
 	k_thread_create(&thread_a_id, stack_a, TASK_STACK_SIZE, task_a_thread, NULL, NULL, NULL,
 			PRIORITY, K_INHERIT_PERMS, K_FOREVER);
 	k_thread_create(&thread_b_id, stack_b, TASK_STACK_SIZE, task_b_thread, NULL, NULL, NULL,
@@ -320,6 +362,12 @@ static void create_tasks(void)
 
 static void destroy_tasks(void)
 {
+	run_threads = false;
+
+	/* Release anything parked so the aborts below are not racing a pend. */
+	k_sem_give(&resume_sem);
+	k_sem_give(&resume_sem);
+
 	k_thread_abort(&thread_a_id);
 	k_thread_abort(&thread_b_id);
 
@@ -327,16 +375,26 @@ static void destroy_tasks(void)
 	k_thread_join(&thread_b_id, K_FOREVER);
 }
 
-static void suspend_all_tasks(void)
+static void park_all_tasks(void)
 {
-	k_thread_suspend(&thread_a_id);
-	k_thread_suspend(&thread_b_id);
+	run_threads = false;
+
+	k_wakeup(&thread_a_id);
+	k_wakeup(&thread_b_id);
+
+	/* Both threads park themselves; wait for them so no timeout outlives
+	 * this call.
+	 */
+	k_sem_take(&parked_sem, K_FOREVER);
+	k_sem_take(&parked_sem, K_FOREVER);
 }
 
-static void resume_all_tasks(void)
+static void unpark_all_tasks(void)
 {
-	k_thread_resume(&thread_a_id);
-	k_thread_resume(&thread_b_id);
+	run_threads = true;
+
+	k_sem_give(&resume_sem);
+	k_sem_give(&resume_sem);
 }
 
 static struct pm_notifier notifier = {
@@ -379,17 +437,17 @@ int test_pwr_mgmt_multithread(bool use_logging, uint8_t cycles)
 
 	checks_enabled = true;
 	while (iterations-- > 0) {
-		LOG_INF("Suspend...");
-		suspend_all_tasks();
+		LOG_INF("Park threads...");
+		park_all_tasks();
 		LOG_INF("About to enter light sleep");
 		pm_sleep_and_measure(light_sleep_ms(), "light sleep");
 		report_wake(use_logging, "Wake from Light Sleep");
 
 		LOG_INF("Resume");
-		resume_all_tasks();
+		unpark_all_tasks();
 
-		LOG_INF("Suspend...");
-		suspend_all_tasks();
+		LOG_INF("Park threads...");
+		park_all_tasks();
 		LOG_INF("About to enter deep sleep");
 
 		pm_trigger_marker();
@@ -398,7 +456,7 @@ int test_pwr_mgmt_multithread(bool use_logging, uint8_t cycles)
 
 		pm_exit_marker();
 		LOG_INF("Resume");
-		resume_all_tasks();
+		unpark_all_tasks();
 	}
 
 	destroy_tasks();

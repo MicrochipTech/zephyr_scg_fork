@@ -21,9 +21,14 @@ entry/exit counters, only in uptime drifting away from wall time, so the
 sample fails if any sleep is off by more than 20 ms.
 
 Each run performs single-threaded and multi-threaded cycles. The
-multi-threaded variant creates two periodic threads and suspends them around
-each sleep: deep sleep is only reachable while they are suspended, since a
-running thread wakes the system before the deep residency is met.
+multi-threaded variant creates two periodic threads and parks them around each
+sleep: deep sleep is only reachable while they are parked, since a running
+thread wakes the system before the deep residency is met.
+
+The threads park on a semaphore rather than being suspended.
+:c:func:`k_thread_suspend` does not cancel a pending timeout, so a thread
+suspended part-way through :c:func:`k_msleep` keeps it live and the kernel
+wakes to service it, cutting the sleep under test short.
 
 Build variants
 **************
@@ -45,6 +50,9 @@ both are worth testing.
    the suspend and resumes on wake. This is expected, not a hang.
 
 The sample logs which of the two it was built with on startup.
+
+To switch the kernel timer from the RTOS timer to the capture/compare driver,
+add ``-DEXTRA_DTC_OVERLAY_FILE=cct_ktimer.overlay``.
 
 Building and Running
 ********************
