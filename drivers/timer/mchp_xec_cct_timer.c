@@ -321,17 +321,15 @@ void z_sys_clock_lpm_enter(uint64_t max_lpm_time_us)
 	uint32_t counts;
 
 	/*
-	 * A one-shot down-counter halts at 0 rather than wrapping, so it cannot
-	 * measure a sleep longer than the interval it was armed for: the
-	 * overshoot is lost and uptime falls behind by that much. Arming the
-	 * full range for an unbounded idle keeps that bound as far out as the
-	 * hardware allows, 2^32 / 32768 = 131072 s, about 36 hours.
-	 *
-	 * Nothing here can do better: the kernel's own deadline is what bounds
-	 * a non-forever sleep, and a wake source other than this timer ends the
-	 * sleep before the bound matters. A SYS_CLOCK_IDLE_FOREVER idle with no
-	 * other wake source is the one case that can reach it, and it is also
-	 * the case where the kernel has already accepted uptime drift.
+	 * An unbounded idle is armed with the full 32-bit range, 2^32 / 32768 =
+	 * 131072 s or about 36 hours. The system does not stay asleep past that:
+	 * the counter reaching 0 raises the RTOS_TIMER event, which is enabled
+	 * in GIRQ23 below and routed to its own NVIC vector in direct mode, so
+	 * it wakes the CPU from WFI. The wake is accounted in full, the kernel
+	 * finds nothing to do, and the idle loop sleeps again with a fresh
+	 * interval. So a forever idle becomes a chain of 36 hour sleeps rather
+	 * than one sleep that loses time, at a cost of one PM exit and re-entry
+	 * per interval.
 	 */
 	if (max_lpm_time_us >= max_us) {
 		counts = UINT32_MAX;
@@ -365,11 +363,11 @@ uint64_t z_sys_clock_lpm_exit(void)
 	/* The count register reads 0 in two different situations, so it alone
 	 * cannot say how long the timer ran:
 	 *
-	 *   - The timer reached 0 and halted (one-shot, AUTO_RELOAD clear). It
-	 *     ran for the full armed interval, and because it halts rather than
-	 *     wrapping, any sleep longer than that interval also reads 0: the
-	 *     timer stops measuring and the overshoot is unknowable from this
-	 *     block. Section 26.8.
+	 *   - The timer reached 0 and halted (one-shot, AUTO_RELOAD clear),
+	 *     having run the full armed interval. Section 26.8. Reaching 0 also
+	 *     wakes the CPU, so the sleep ends here rather than running on past
+	 *     the interval; what the counter cannot measure is only the gap
+	 *     between halting and this read, bounded by interrupt latency.
 	 *   - The wake arrived so early that the preload had not yet reached the
 	 *     count register, which takes up to one 32 KHz clock. Nothing had
 	 *     elapsed.
