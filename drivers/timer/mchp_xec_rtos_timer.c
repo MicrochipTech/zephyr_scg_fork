@@ -16,6 +16,8 @@
 #include <cmsis_core.h>
 #include <zephyr/irq.h>
 
+#include "mchp_xec_rtos_timer.h"
+
 BUILD_ASSERT(!IS_ENABLED(CONFIG_SMP), "XEC RTOS timer doesn't support SMP");
 BUILD_ASSERT(CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC == 32768,
 	     "XEC RTOS timer HW frequency is fixed at 32768");
@@ -286,6 +288,39 @@ void arch_busy_wait(uint32_t usec_to_wait)
 		}
 	}
 }
+
+/* Set when the deep-sleep save actually stopped the timer, so the restore
+ * leaves an already-stopped timer alone.
+ */
+static bool btmr_dsleep_stopped;
+
+void mchp_xec_rtos_timer_dsleep_save(void)
+{
+	if ((sys_read32(BTMR_BASE + BTMR_CR_OFS) & BIT(BTMR_CR_ACTV_POS)) == 0U) {
+		btmr_dsleep_stopped = false;
+		return;
+	}
+
+	sys_clear_bit(BTMR_BASE + BTMR_CR_OFS, BTMR_CR_ACTV_POS);
+	btmr_dsleep_stopped = true;
+}
+
+void mchp_xec_rtos_timer_dsleep_restore(void)
+{
+	if (!btmr_dsleep_stopped) {
+		return;
+	}
+
+	/* Only the block enable is restored, not the count: the timer is a
+	 * free-running up-counter and arch_busy_wait() reads differences, so
+	 * where it resumes does not matter. A busy wait never spans a sleep,
+	 * so no caller is holding a start value from before it. Do not turn
+	 * this into a full re-init.
+	 */
+	sys_set_bit(BTMR_BASE + BTMR_CR_OFS, BTMR_CR_ACTV_POS);
+	btmr_dsleep_stopped = false;
+}
+
 #endif
 
 static int sys_clock_driver_init(void)

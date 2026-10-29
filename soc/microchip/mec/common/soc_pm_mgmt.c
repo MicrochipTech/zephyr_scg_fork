@@ -11,6 +11,8 @@
 #include <zephyr/pm/pm.h>
 #include <zephyr/sys/sys_io.h>
 
+#include <mchp_xec_rtos_timer.h>
+
 #define XEC_PCR_REG_BASE DT_REG_ADDR(DT_NODELABEL(pcr))
 
 #define XEC_PCR_SLP_CR_OFS          0
@@ -74,6 +76,20 @@ static void soc_xec_save_pcr_clk_req_to_vbm(uint32_t start_idx)
 
 static uint8_t basic_timer_cr_save[XEC_BASIC_TIMER_INSTANCES];
 static uint8_t uart_actv_save[MEC165XB_UART_INSTANCES];
+
+/* Weak fallbacks so this file links against any kernel timer. The XEC RTOS
+ * timer driver overrides both when it is the kernel timer and has borrowed a
+ * basic timer for arch_busy_wait(); every other configuration has no such
+ * timer and wants the no-op. No caller yet: the deep-sleep path switches to
+ * them in a following commit.
+ */
+void __weak mchp_xec_rtos_timer_dsleep_save(void)
+{
+}
+
+void __weak mchp_xec_rtos_timer_dsleep_restore(void)
+{
+}
 
 static void save_basic_timers(void)
 {
