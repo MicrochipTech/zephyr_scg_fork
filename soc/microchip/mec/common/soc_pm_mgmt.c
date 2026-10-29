@@ -5,6 +5,7 @@
  */
 
 #include <soc.h>
+#include <zephyr/arch/arch_interface.h>
 #include <zephyr/arch/cpu.h>
 #include <zephyr/kernel.h>
 #include <zephyr/pm/pm.h>
@@ -34,6 +35,42 @@
 #endif
 
 #define XEC_UART0_REG_BASE DT_REG_ADDR(DT_NODELABEL(uart0))
+
+#ifdef CONFIG_SOC_MEC_PM_DBG_PCR_CLK_REQ_VBM
+#define CLK_REQ_VMB_IDX CONFIG_SOC_MEM_PM_DBG_PCR_CLK_REQ_VBM_OFS
+
+#define XEC_VBM_BASE DT_REG_ADDR(DT_NODELABEL(bbram))
+#define XEC_VBM_SIZE DT_REG_SIZE(DT_NODELABEL(bbram))
+
+static void soc_xec_save_pcr_clk_req_to_vbm(uint32_t start_idx)
+{
+	uintptr_t clk_req_addr = XEC_PCR_CLK_REQ_BASE;
+	uintptr_t vbm_addr = XEC_VBM_BASE;
+
+	if ((start_idx & 0x03U) != 0) {
+		return;
+	}
+
+	vbm_addr += start_idx;
+
+	for (uint32_t i = 0; i < XEC_CC_PCR_MAX_SCR; i++) {
+		if (vbm_addr > (XEC_VBM_BASE + XEC_VBM_SIZE - 4U)) {
+			break;
+		}
+
+		uint32_t r = sys_read32(clk_req_addr);
+
+		sys_write32(r, vbm_addr);
+		clk_req_addr += 4U;
+		vbm_addr += 4U;
+	}
+}
+
+#define XEC_SAVE_PCR_CLK_REQ_TO_VBM(idx) soc_xec_save_pcr_clk_req_to_vbm(idx)
+#else
+#define CLK_REQ_VMB_IDX 0
+#define XEC_SAVE_PCR_CLK_REQ_TO_VBM(idx)
+#endif
 
 static uint8_t basic_timer_cr_save[XEC_BASIC_TIMER_INSTANCES];
 static uint8_t uart_actv_save[MEC165XB_UART_INSTANCES];
@@ -84,8 +121,11 @@ static void restore_uarts(void)
 	}
 }
 
-/* Peripheral's that don't obey PCR sleep signals
- * Basic timers, and more ...
+/* Peripheral's that don't obey PCR sleep signals and can't be disabled until just
+ * before WFI: basic timers and UARTs.
+ * NOTE: UARTs should be handled at the app/driver level.
+ * PM=y PM_DEVICE=n app/driver should use PM notifier for UARTs
+ * PM_DEVICE=y UART driver set/clear busy bit and implements PM action callback.
  */
 static void soc_deep_sleep_periph_save(void)
 {
@@ -100,20 +140,18 @@ static void soc_deep_sleep_periph_restore(void)
 }
 
 /*
- * Enable deep sleep mode in CM4 and MEC172x.
+ * Enable deep sleep mode in CM4 and MEC.
  * Enable CM4 deep sleep and sleep signals assertion on WFI.
  * Set MCHP Heavy sleep (PLL OFF when all CLK_REQ clear) and SLEEP_ALL
  * to assert SLP_EN to all peripherals on WFI.
+ * Save BASEPRI, set PRIMASK = 1 so on wake the CPU will not vector to any ISR,
+ * and set BASEPRI = 0 to allow any priority to wake.
  * WFI triggers MEC HW to enter deep sleep.
- * On wake clear SLEEP_ALL manually, de-asserting peripheral SLP_EN, since no
- * ISR runs until the kernel idle thread restores the interrupt state.
- *
- * Interrupt masking around WFI is the architecture's job:
- * arch_pm_state_set_prepare() saves BASEPRI, sets PRIMASK so no ISR is entered
- * on wake, and clears BASEPRI so any enabled interrupt can wake the CPU.
- * arch_pm_state_set_finish() restores the saved BASEPRI and clears PRIMASK. It
- * is called only after the PLL has locked and peripherals are restored: ISRs
- * must not run while the chip is still on the ring oscillator.
+ * On wake:
+ * Clear SLEEP_ALL manually since we are not vectoring to an ISR until
+ * PM resume completes. This de-asserts peripheral SLP_EN signals.
+ * Wait for the PLL to lock before restoring peripherals and restoring
+ * BASEPRI/PRIMASK via arch_pm_state_set_finish().
  */
 static void z_power_soc_deep_sleep(void)
 {
@@ -122,15 +160,19 @@ static void z_power_soc_deep_sleep(void)
 	uint32_t val = BIT(XEC_PCR_SLP_CR_DEEP_SLP_POS) | BIT(XEC_PCR_SLP_CR_ALL_POS);
 	unsigned int key;
 
+	key = arch_pm_state_set_prepare();
+
 	soc_deep_sleep_periph_save();
 
 	SCB->SCR |= BIT(SCB_SCR_SLEEPDEEP_Pos);
 
 	soc_mmcr_mask_set(pcrbase + XEC_PCR_SLP_CR_OFS, val, msk);
 
-	key = arch_pm_state_set_prepare();
+	XEC_SAVE_PCR_CLK_REQ_TO_VBM(CLK_REQ_VMB_IDX);
 
-	__WFI(); /* triggers sleep hardware */
+	__DSB();
+	__ISB();
+	__WFI();
 	__NOP();
 	__NOP();
 
@@ -165,12 +207,14 @@ static void z_power_soc_sleep(void)
 	uint32_t val = BIT(XEC_PCR_SLP_CR_ALL_POS);
 	unsigned int key;
 
+	key = arch_pm_state_set_prepare();
+
 	SCB->SCR &= ~BIT(SCB_SCR_SLEEPDEEP_Pos);
 
 	soc_mmcr_mask_set(pcrbase + XEC_PCR_SLP_CR_OFS, val, msk);
 
-	key = arch_pm_state_set_prepare();
-
+	__DSB();
+	__ISB();
 	__WFI(); /* triggers sleep hardware */
 	__NOP();
 	__NOP();
