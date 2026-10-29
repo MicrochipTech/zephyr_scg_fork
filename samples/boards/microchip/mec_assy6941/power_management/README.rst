@@ -86,6 +86,16 @@ Watch two things on a scope during this phase:
 * With ``CONFIG_SOC_MEC_PM_DBG_PCR_CLK_REQ_VBM=y`` the saved ``CLK_REQ``
   registers should show this timer's bit set on sleep entry.
 
+The phase runs once, at the end of a roughly 100 second run, so it is easy to
+miss among the repeating pattern of the earlier phases. The board overlay
+therefore drives GPIO004, which is pulled up on the EVB, low for the duration
+of the phase: trigger on its falling edge to capture this phase alone.
+
+Measured on MEC1753 with a 4000 ms alarm inside a 6000 ms sleep: the trigger
+is low for 6.06 s, the PLL stays on for the first 4.04 s, and gates for the
+remainder. The PLL holds up for exactly as long as the alarm is armed and
+gates once it has fired, which is the behaviour described above.
+
 Without the overlay the phase logs that it is skipping and returns success, so
 the default build is unaffected. ``timer5`` is deliberately not used: the XEC
 RTOS kernel timer borrows it for ``k_busy_wait()``.

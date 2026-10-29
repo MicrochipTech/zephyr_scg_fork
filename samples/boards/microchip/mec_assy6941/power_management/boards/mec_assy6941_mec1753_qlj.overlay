@@ -10,6 +10,11 @@
 	pinctrl-names = "default";
 };
 
+/* GPIO004 is pulled up on the EVB and is used purely as a scope trigger: the
+ * sample drives it low across the counter alarm phase so that phase's PLL
+ * behaviour can be captured on its own, separately from the repeating pattern
+ * of the earlier phases.
+ */
 / {
 	zephyr,user {
 		gpios = <MCHP_GPIO_DECODE_004 GPIO_ACTIVE_HIGH>;

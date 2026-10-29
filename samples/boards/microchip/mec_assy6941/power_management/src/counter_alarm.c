@@ -50,16 +50,22 @@ LOG_MODULE_DECLARE(mec_assy6941_pm, LOG_LEVEL_INF);
 static const struct device *const counter_dev = DEVICE_DT_GET(ALARM_COUNTER_NODE);
 
 static struct k_sem alarm_fired;
-static uint32_t alarm_ticks_at_fire;
 
+/*
+ * The ticks argument is not recorded. This driver's ISR passes counter->CNT,
+ * and by then the one-shot has expired and the block has reloaded from PRLD,
+ * so the value read is the preload rather than the count at the alarm: on a
+ * 32-bit timer it is always UINT32_MAX. The uptime delta around the sleep is
+ * the meaningful measure, and the semaphore is what says the alarm arrived.
+ */
 static void alarm_handler(const struct device *dev, uint8_t chan_id, uint32_t ticks,
 			  void *user_data)
 {
 	ARG_UNUSED(dev);
 	ARG_UNUSED(chan_id);
+	ARG_UNUSED(ticks);
 	ARG_UNUSED(user_data);
 
-	alarm_ticks_at_fire = ticks;
 	k_sem_give(&alarm_fired);
 }
 
@@ -115,8 +121,8 @@ int test_pwr_mgmt_counter_alarm(void)
 		return -EIO;
 	}
 
-	LOG_INF("Alarm fired across deep sleep at %u ticks, uptime advanced %lld ms",
-		alarm_ticks_at_fire, (long long)elapsed);
+	LOG_INF("Alarm fired across deep sleep; uptime advanced %lld ms of %u ms requested",
+		(long long)elapsed, ALARM_SLEEP_MS);
 
 	/* The driver's pm_action left the block alone, so the counter is still
 	 * running here. Stop it so the following phases can gate the PLL.

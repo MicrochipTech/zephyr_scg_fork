@@ -19,7 +19,11 @@ BUILD_ASSERT(IS_ENABLED(CONFIG_PM), "this sample requires CONFIG_PM");
 
 #define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
 
-const struct gpio_dt_spec marker_gpio = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, gpios);
+/* GPIO004 on the EVB, pulled up, used purely as a scope trigger: it is driven
+ * low across the counter alarm phase so the PLL behaviour during that phase can
+ * be captured on its own. See the README.
+ */
+static const struct gpio_dt_spec marker_gpio = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, gpios);
 
 /*
  * CONFIG_PM alone leaves every device enabled across a low-power state, so the
@@ -84,7 +88,7 @@ int main(void)
 
 	ret = gpio_pin_configure_dt(&marker_gpio, GPIO_OUTPUT_HIGH);
 	if (ret != 0) {
-		LOG_ERR("Could not configure marget_gpio (%d)", ret);
+		LOG_ERR("Could not configure the GPIO004 scope marker (%d)", ret);
 	}
 
 	flush_console();
@@ -117,7 +121,8 @@ int main(void)
 	}
 	flush_console();
 
-	gpio_pin_set_raw(marker_gpio.port, marker_gpio.pin, 0); 
+	/* Scope trigger: the pin idles high and is driven low across the phase. */
+	gpio_pin_set_raw(marker_gpio.port, marker_gpio.pin, 0);
 	ret = test_pwr_mgmt_counter_alarm();
 	gpio_pin_set_raw(marker_gpio.port, marker_gpio.pin, 1);
 
