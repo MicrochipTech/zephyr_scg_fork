@@ -22,12 +22,6 @@
 #define XEC_PCR_OSC_ID_OFS          0x0CU
 #define XEC_PCR_OSC_ID_PLL_LOCK_POS 8
 
-#define XEC_BASIC_TIMER_INSTANCES 6
-#define XEC_BASIC_TIMER_SPACING   0x20U
-#define XEC_BASIC_TIMER0_REG_BASE DT_REG_ADDR(DT_NODELABEL(timer0))
-#define XEC_BASIC_TIMER_CR_OFS    0x10U
-#define XEC_BASIC_TIMER_CR_EN_POS 0
-
 #if DT_NODE_EXISTS(DT_NODELABEL(uart3))
 #define MEC165XB_UART_INSTANCES 4
 #elif DT_NODE_EXISTS(DT_NODELABEL(uart2))
@@ -74,14 +68,12 @@ static void soc_xec_save_pcr_clk_req_to_vbm(uint32_t start_idx)
 #define XEC_SAVE_PCR_CLK_REQ_TO_VBM(idx)
 #endif
 
-static uint8_t basic_timer_cr_save[XEC_BASIC_TIMER_INSTANCES];
 static uint8_t uart_actv_save[MEC165XB_UART_INSTANCES];
 
 /* Weak fallbacks so this file links against any kernel timer. The XEC RTOS
  * timer driver overrides both when it is the kernel timer and has borrowed a
  * basic timer for arch_busy_wait(); every other configuration has no such
- * timer and wants the no-op. No caller yet: the deep-sleep path switches to
- * them in a following commit.
+ * timer and wants the no-op.
  */
 void __weak mchp_xec_rtos_timer_dsleep_save(void)
 {
@@ -89,31 +81,6 @@ void __weak mchp_xec_rtos_timer_dsleep_save(void)
 
 void __weak mchp_xec_rtos_timer_dsleep_restore(void)
 {
-}
-
-static void save_basic_timers(void)
-{
-	mm_reg_t rb = (mm_reg_t)(XEC_BASIC_TIMER0_REG_BASE);
-
-	for (uint32_t n = 0; n < XEC_BASIC_TIMER_INSTANCES; n++) {
-		uint32_t temp = sys_read32(rb + XEC_BASIC_TIMER_CR_OFS);
-
-		sys_write32(temp & ~BIT(XEC_BASIC_TIMER_CR_EN_POS), rb + XEC_BASIC_TIMER_CR_OFS);
-		basic_timer_cr_save[n] = (uint8_t)(temp & BIT(XEC_BASIC_TIMER_CR_EN_POS));
-		rb += XEC_BASIC_TIMER_SPACING;
-	}
-}
-
-static void restore_basic_timers(void)
-{
-	mm_reg_t rb = (mm_reg_t)(XEC_BASIC_TIMER0_REG_BASE);
-
-	for (uint32_t n = 0; n < XEC_BASIC_TIMER_INSTANCES; n++) {
-		if (basic_timer_cr_save[n] != 0) {
-			sys_set_bit(rb + XEC_BASIC_TIMER_CR_OFS, XEC_BASIC_TIMER_CR_EN_POS);
-		}
-		rb += XEC_BASIC_TIMER_SPACING;
-	}
 }
 
 static void save_uarts(void)
@@ -139,19 +106,25 @@ static void restore_uarts(void)
 
 /* Peripheral's that don't obey PCR sleep signals and can't be disabled until just
  * before WFI: basic timers and UARTs.
+ *
+ * The kernel timer's borrowed basic timer is handled by the driver that owns
+ * it, through the private interface in drivers/timer/mchp_xec_rtos_timer.h.
+ * Any other basic timer instance belongs to whatever driver claimed it and is
+ * that driver's responsibility, via PM_DEVICE or a PM notifier.
+ *
  * NOTE: UARTs should be handled at the app/driver level.
  * PM=y PM_DEVICE=n app/driver should use PM notifier for UARTs
  * PM_DEVICE=y UART driver set/clear busy bit and implements PM action callback.
  */
 static void soc_deep_sleep_periph_save(void)
 {
-	save_basic_timers();
+	mchp_xec_rtos_timer_dsleep_save();
 	save_uarts();
 }
 
 static void soc_deep_sleep_periph_restore(void)
 {
-	restore_basic_timers();
+	mchp_xec_rtos_timer_dsleep_restore();
 	restore_uarts();
 }
 
