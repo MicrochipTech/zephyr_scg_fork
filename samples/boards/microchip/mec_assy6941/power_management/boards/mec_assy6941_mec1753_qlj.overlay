@@ -3,7 +3,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <zephyr/dt-bindings/gpio/microchip-xec-gpio.h>
+
 &pcr {
 	pinctrl-0 = <&tst_clk_out_gpio060>;
 	pinctrl-names = "default";
+};
+
+/ {
+	zephyr,user {
+		gpios = <MCHP_GPIO_DECODE_004 GPIO_ACTIVE_HIGH>;
+	};
 };

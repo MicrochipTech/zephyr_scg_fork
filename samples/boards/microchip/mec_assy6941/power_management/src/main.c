@@ -5,6 +5,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/pm/device.h>
 #include <zephyr/logging/log.h>
 
@@ -15,6 +16,10 @@ LOG_MODULE_REGISTER(mec_assy6941_pm, LOG_LEVEL_INF);
 #define MAX_CYCLES 5U
 
 BUILD_ASSERT(IS_ENABLED(CONFIG_PM), "this sample requires CONFIG_PM");
+
+#define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
+
+const struct gpio_dt_spec marker_gpio = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, gpios);
 
 /*
  * CONFIG_PM alone leaves every device enabled across a low-power state, so the
@@ -76,6 +81,12 @@ int main(void)
 	int result = 0;
 
 	report_build_config();
+
+	ret = gpio_pin_configure_dt(&marker_gpio, GPIO_OUTPUT_HIGH);
+	if (ret != 0) {
+		LOG_ERR("Could not configure marget_gpio (%d)", ret);
+	}
+
 	flush_console();
 
 	ret = test_pwr_mgmt_singlethread(false, MAX_CYCLES);
@@ -106,7 +117,10 @@ int main(void)
 	}
 	flush_console();
 
+	gpio_pin_set_raw(marker_gpio.port, marker_gpio.pin, 0); 
 	ret = test_pwr_mgmt_counter_alarm();
+	gpio_pin_set_raw(marker_gpio.port, marker_gpio.pin, 1);
+
 	if (ret != 0) {
 		LOG_ERR("Counter alarm test failed: %d", ret);
 		result = ret;
