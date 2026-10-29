@@ -28,6 +28,7 @@
 LOG_MODULE_REGISTER(counter_mchp_xec, CONFIG_COUNTER_LOG_LEVEL);
 
 #include <zephyr/drivers/counter.h>
+#include <zephyr/pm/device.h>
 #include <soc.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -46,6 +47,21 @@ struct counter_xec_data {
 	counter_alarm_callback_t alarm_cb;
 	counter_top_callback_t top_cb;
 	void *user_data;
+#ifdef CONFIG_PM_DEVICE
+	/* Control register as of the last suspend, and whether the block was
+	 * counting then. The count itself is not saved: it holds its value
+	 * across the enable being cleared, and a consumer that depends on the
+	 * count holds an alarm or top callback, which makes the device busy and
+	 * so not suspended at all.
+	 */
+	uint32_t ctrl_save;
+	bool resume_running;
+	/* Whether the last suspend actually stopped the block. False when it
+	 * was left running for an armed event, so the resume knows there is
+	 * nothing to put back.
+	 */
+	bool suspended;
+#endif
 };
 
 #define COUNTER_XEC_REG_BASE(_dev)                                                                 \
@@ -265,6 +281,85 @@ static void counter_xec_isr(const struct device *dev)
 	}
 }
 
+#ifdef CONFIG_PM_DEVICE
+/*
+ * Basic Timers ignore the chip's SLP_EN signal: a running one keeps its
+ * CLK_REQ asserted and the PCR will not gate the PLL while any CLK_REQ is set.
+ * Clearing the block enable is what drops CLK_REQ.
+ *
+ * A counter with a pending alarm or a periodic top callback must keep running,
+ * or the event the application asked for never arrives. Such a counter is left
+ * alone on suspend. The consequence is confined to power: the PM sequence still
+ * runs and the CPU still enters the low-power state, but the PCR sees this
+ * block's CLK_REQ and keeps the PLL on, so the part draws more than it would
+ * in full deep sleep. That cost is the application's choice, taken only when it
+ * has actually armed a counter event.
+ *
+ * Suspend deliberately reports success in that case rather than an error.
+ * pm_suspend_devices() treats any error other than -ENOSYS, -ENOTSUP or
+ * -EALREADY as a failure to suspend the system, which aborts the whole
+ * transition and resumes every device already suspended. Refusing here would
+ * therefore cost the sleep entirely, not just the PLL.
+ *
+ * A counter that is merely running with nothing armed has no event to miss, so
+ * it is stopped and deep sleep proceeds. The PM core separately skips a device
+ * that is busy, has runtime PM enabled, or is a wake-up source, so marking a
+ * device busy is still the way to keep it untouched for any other reason.
+ */
+static int counter_xec_pm_action(const struct device *dev, enum pm_device_action action)
+{
+	struct btmr_regs *counter = COUNTER_XEC_REG_BASE(dev);
+	const struct counter_xec_config *counter_cfg = COUNTER_XEC_CONFIG(dev);
+	struct counter_xec_data *data = COUNTER_XEC_DATA(dev);
+
+	switch (action) {
+	case PM_DEVICE_ACTION_SUSPEND:
+		/* An armed alarm or a periodic top callback needs the block to
+		 * keep counting, so leave it running and let the PLL stay on.
+		 * Nothing is saved, and the matching resume has nothing to do.
+		 */
+		if ((data->alarm_cb != NULL) || (data->top_cb != NULL)) {
+			data->suspended = false;
+			break;
+		}
+
+		data->ctrl_save = counter->CTRL;
+		data->resume_running = (data->ctrl_save & MCHP_BTMR_CTRL_ENABLE) != 0U;
+		data->suspended = true;
+
+		/* Clear START as well as ENABLE so the block cannot resume
+		 * counting on its own when the enable comes back; the resume
+		 * decides that from resume_running.
+		 */
+		counter->CTRL &= ~(MCHP_BTMR_CTRL_ENABLE | MCHP_BTMR_CTRL_START);
+		soc_xec_pcr_sleep_en_set(counter_cfg->enc_pcr);
+		break;
+	case PM_DEVICE_ACTION_RESUME:
+		if (!data->suspended) {
+			break;
+		}
+
+		soc_xec_pcr_sleep_en_clear(counter_cfg->enc_pcr);
+
+		/* Restore the configuration (prescale, count direction,
+		 * auto-restart) without starting the block, then start it only
+		 * if it was counting when suspended.
+		 */
+		counter->CTRL = data->ctrl_save &
+				~(MCHP_BTMR_CTRL_ENABLE | MCHP_BTMR_CTRL_START);
+
+		if (data->resume_running) {
+			counter->CTRL |= (MCHP_BTMR_CTRL_ENABLE | MCHP_BTMR_CTRL_START);
+		}
+		break;
+	default:
+		return -ENOTSUP;
+	}
+
+	return 0;
+}
+#endif /* CONFIG_PM_DEVICE */
+
 static DEVICE_API(counter, counter_xec_api) = {
 	.start = counter_xec_start,
 	.stop = counter_xec_stop,
@@ -326,9 +421,11 @@ static int counter_xec_init(const struct device *dev)
 		.enc_pcr = DT_INST_PROP(inst, pcr_src),                                            \
 	};                                                                                         \
                                                                                                    \
-	DEVICE_DT_INST_DEFINE(inst, counter_xec_init, NULL, &counter_xec_dev_data_##inst,          \
-			      &counter_xec_dev_config_##inst, POST_KERNEL,                         \
-			      CONFIG_COUNTER_INIT_PRIORITY, &counter_xec_api);                     \
+	PM_DEVICE_DT_INST_DEFINE(inst, counter_xec_pm_action);                                     \
+                                                                                                   \
+	DEVICE_DT_INST_DEFINE(inst, counter_xec_init, PM_DEVICE_DT_INST_GET(inst),                 \
+			      &counter_xec_dev_data_##inst, &counter_xec_dev_config_##inst,        \
+			      POST_KERNEL, CONFIG_COUNTER_INIT_PRIORITY, &counter_xec_api);        \
                                                                                                    \
 	static void counter_xec_irq_config_##inst(void)                                            \
 	{                                                                                          \
