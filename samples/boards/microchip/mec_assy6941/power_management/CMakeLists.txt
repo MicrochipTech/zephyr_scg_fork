@@ -8,4 +8,5 @@ project(mec_assy6941_pm)
 target_sources(app PRIVATE
   src/main.c
   src/power_mgmt.c
+  src/counter_alarm.c
 )

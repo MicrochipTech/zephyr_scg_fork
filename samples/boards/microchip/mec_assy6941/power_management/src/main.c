@@ -106,6 +106,13 @@ int main(void)
 	}
 	flush_console();
 
+	ret = test_pwr_mgmt_counter_alarm();
+	if (ret != 0) {
+		LOG_ERR("Counter alarm test failed: %d", ret);
+		result = ret;
+	}
+	flush_console();
+
 	ret = test_pwr_mgmt_check_uptime();
 	if (ret != 0) {
 		result = ret;

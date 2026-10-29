@@ -1,0 +1,18 @@
+/*
+ * Copyright (c) Microchip Technology Inc.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Enable a 32-bit basic timer as a counter device and name it for the
+ * sample's counter alarm phase. timer5 is deliberately not used: the XEC
+ * RTOS kernel timer borrows it for arch_busy_wait().
+ */
+
+/ {
+	chosen {
+		zephyr,counter = &timer4;
+	};
+};
+
+&timer4 {
+	status = "okay";
+};

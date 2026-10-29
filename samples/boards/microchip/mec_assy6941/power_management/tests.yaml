@@ -19,3 +19,9 @@ tests:
   sample.boards.mec_assy6941.pm.device:
     extra_args:
       - CONF_FILE="pm-device.conf"
+  sample.boards.mec_assy6941.pm.counter_alarm:
+    extra_args:
+      - CONF_FILE="pm-device.conf"
+      - EXTRA_DTC_OVERLAY_FILE="counter_alarm.overlay"
+    extra_configs:
+      - CONFIG_COUNTER=y

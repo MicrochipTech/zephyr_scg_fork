@@ -49,4 +49,22 @@ int test_pwr_mgmt_multithread(bool use_logging, uint8_t cycles);
  */
 int test_pwr_mgmt_check_uptime(void);
 
+/** @brief Enters deep sleep with a counter alarm armed.
+ *
+ * The XEC counter driver's pm_action leaves a counter running when an alarm
+ * or periodic top callback is armed, because stopping it would drop the event
+ * the application asked for. A running Basic Timer holds its CLK_REQ, so the
+ * PCR keeps the PLL on for the sleep: the cost of an armed alarm is power, not
+ * a missed event. This exercises that branch, which no other phase reaches.
+ *
+ * Does nothing unless a counter device is named by
+ * chosen { zephyr,counter }; see counter_alarm.overlay.
+ *
+ * @retval 0 if the alarm fired across the sleep, or no counter is configured.
+ * @retval -ENODEV if the chosen counter is not ready.
+ * @retval -EIO if the alarm did not fire.
+ * @retval other errno from the counter API.
+ */
+int test_pwr_mgmt_counter_alarm(void);
+
 #endif /* __TEST_PWRMGMT_H__ */

@@ -54,6 +54,42 @@ The sample logs which of the two it was built with on startup.
 To switch the kernel timer from the RTOS timer to the capture/compare driver,
 add ``-DEXTRA_DTC_OVERLAY_FILE=cct_ktimer.overlay``.
 
+Counter alarm phase
+===================
+
+``counter_alarm.overlay`` enables a 32-bit Basic Timer as a counter device and
+names it through ``chosen { zephyr,counter }``. With it, and with
+``CONFIG_COUNTER=y``, the sample adds a final phase that arms a counter alarm
+and then enters deep sleep with it pending:
+
+.. code-block:: console
+
+   west build -b mec_assy6941/mec1753_qlj -- \
+       -DCONF_FILE=pm-device.conf \
+       -DEXTRA_DTC_OVERLAY_FILE=counter_alarm.overlay \
+       -DCONFIG_COUNTER=y
+
+This covers the one branch of the XEC counter driver's ``pm_action`` that the
+other phases never reach. A Basic Timer ignores the chip's ``SLP_EN``, so one
+left running holds its ``CLK_REQ`` and the PCR will not gate the PLL. The
+driver therefore stops a counter on suspend *except* when an alarm or a
+periodic top callback is armed, where stopping it would drop the event the
+application asked for. The sleep still happens and the CPU still enters the
+low-power state; what is lost is the PLL being gated, so the part draws more
+power. That is the intended trade, and it only applies while an application
+has armed a counter event.
+
+Watch two things on a scope during this phase:
+
+* TEST_CLK_OUT (GPIO060) stays active through the sleep, where the other
+  phases show it gated. That is the PLL being held up, and is expected here.
+* With ``CONFIG_SOC_MEC_PM_DBG_PCR_CLK_REQ_VBM=y`` the saved ``CLK_REQ``
+  registers should show this timer's bit set on sleep entry.
+
+Without the overlay the phase logs that it is skipping and returns success, so
+the default build is unaffected. ``timer5`` is deliberately not used: the XEC
+RTOS kernel timer borrows it for ``k_busy_wait()``.
+
 Building and Running
 ********************
 
